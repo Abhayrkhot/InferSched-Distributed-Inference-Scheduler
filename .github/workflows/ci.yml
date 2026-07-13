@@ -86,6 +86,14 @@ jobs:
           docker compose ps
           exit 1
 
+      - name: Create Kafka topics
+        run: |
+          for topic in inference.requests inference.results inference.dlq inference.traces; do
+            docker exec infersched-kafka /opt/kafka/bin/kafka-topics.sh \
+              --bootstrap-server localhost:9092 --create --if-not-exists \
+              --topic "$topic" --partitions 12 --replication-factor 1
+          done
+
       - name: Configure and build
         run: |
           cmake --preset default
