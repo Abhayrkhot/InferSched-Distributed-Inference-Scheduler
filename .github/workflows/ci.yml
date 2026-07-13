@@ -14,7 +14,7 @@ jobs:
       matrix:
         preset: [default, asan, tsan]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install native dependencies
         run: |
@@ -22,7 +22,7 @@ jobs:
           echo "$(brew --prefix libpq)/bin" >> "$GITHUB_PATH"
           echo "PostgreSQL_ROOT=$(brew --prefix libpq)" >> "$GITHUB_ENV"
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -47,7 +47,7 @@ jobs:
     name: live-kafka-postgres-redis
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install native dependencies
         run: |
@@ -63,7 +63,7 @@ jobs:
           cmake --build /tmp/libpqxx-build --parallel
           sudo cmake --install /tmp/libpqxx-build
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -75,7 +75,16 @@ jobs:
       - name: Start infrastructure
         run: |
           docker compose up -d
-          docker compose ps --wait
+          for attempt in $(seq 1 60); do
+            if [[ "$(docker inspect -f '{{.State.Health.Status}}' infersched-kafka)" == "healthy" && \
+                  "$(docker inspect -f '{{.State.Health.Status}}' infersched-postgres)" == "healthy" && \
+                  "$(docker inspect -f '{{.State.Health.Status}}' infersched-redis)" == "healthy" ]]; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker compose ps
+          exit 1
 
       - name: Configure and build
         run: |
