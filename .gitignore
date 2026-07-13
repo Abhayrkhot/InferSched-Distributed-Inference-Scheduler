@@ -1,0 +1,31 @@
+# Build
+/build/
+/cpp/build/
+*.o
+*.a
+*.so
+*.dylib
+compile_commands.json
+
+# Generated protobuf/grpc (generated at build time)
+*.pb.cc
+*.pb.h
+*.grpc.pb.cc
+*.grpc.pb.h
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Benchmark artifacts
+/docs/benchmarks/results/*.csv
+/docs/benchmarks/results/*.json

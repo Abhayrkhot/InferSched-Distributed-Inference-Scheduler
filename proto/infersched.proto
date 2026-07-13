@@ -1,0 +1,170 @@
+syntax = "proto3";
+
+// InferSched — Router <-> Engine control-plane contract.
+//
+// Core protocol design:
+//   * Two-tier ownership: Router coordinates; Engine owns the decode loop + KV.  (§0.0)
+//   * Fence = (partition_id, ownership_epoch, attempt_id); Postgres is the durable
+//     fencing authority, NOT Kafka's consumer generation.                        (§0.1)
+//   * Dispatch returns an explicit ACCEPTED/REJECTED so a stale capacity
+//     advertisement never causes a lost reservation.                             (§0.0)
+//   * Engine streams ProgressEvents at its own cadence — never one RPC per token. (§0.0)
+//
+// This .proto is the stable interface. In early phases the Engine runs in-process
+// behind the same message types; the network transport is added in Phase 4.
+
+package infersched.v1;
+
+// ---------------------------------------------------------------------------
+// Fencing
+// ---------------------------------------------------------------------------
+
+// Every command and every reported event carries the full fence. Engines reject
+// commands whose (ownership_epoch, attempt_id) is older than what they hold, and
+// the Router accepts a completion only when the fence matches the current owner
+// recorded in Postgres.
+message Fence {
+  int32  partition_id    = 1;  // Kafka partition the request belongs to.
+  uint64 ownership_epoch = 2;  // Bumped in Postgres on every partition-ownership change.
+  uint64 attempt_id      = 3;  // Monotonic per request_id, assigned on each (re)dispatch.
+}
+
+// ---------------------------------------------------------------------------
+// Engine registration & liveness
+// ---------------------------------------------------------------------------
+
+message EngineCapacity {
+  uint32 free_kv_blocks   = 1;  // Currently free paged-KV blocks.
+  uint32 total_kv_blocks  = 2;
+  uint32 batch_headroom   = 3;  // Additional sequences the engine can admit now.
+  uint32 running_seqs     = 4;
+  uint32 waiting_seqs     = 5;
+}
+
+message RegisterRequest {
+  string engine_id       = 1;  // Stable logical id of the engine process.
+  string incarnation_id  = 2;  // New per (re)start — invalidates stale prefix-location hints (§0.3).
+  repeated string models = 3;  // Model ids this engine can serve.
+  EngineCapacity capacity = 4;
+  string endpoint         = 5;  // EngineControl address advertised to the Router.
+}
+
+message RegisterReply {
+  bool   accepted            = 1;
+  uint64 assigned_lease_ttl_ms = 2;  // Router-granted lease TTL; renewed via Heartbeat.
+}
+
+message HeartbeatRequest {
+  string engine_id        = 1;
+  string incarnation_id   = 2;
+  EngineCapacity capacity = 3;
+}
+
+message HeartbeatReply {
+  bool   lease_ok = 1;  // false => engine must re-register (its lease expired / epoch moved on).
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch
+// ---------------------------------------------------------------------------
+
+message SamplingParams {
+  uint32 max_output_tokens = 1;
+  double temperature       = 2;
+  double top_p             = 3;
+  uint64 seed              = 4;  // Part of the cache key — affects output (§0.6).
+}
+
+message InferenceRequest {
+  string request_id      = 1;
+  string model_id        = 2;
+  string model_revision  = 3;  // Part of the cache key (§0.6).
+  string tokenizer_revision = 4;  // Part of the cache key (§0.6).
+  uint32 prompt_tokens   = 5;  // Prompt length (simulated workload).
+  string prompt_hash     = 6;  // For prefix/result cache lookup without shipping the prompt.
+  uint32 priority        = 7;  // Higher = more important; aged by the scheduler.
+  int64  deadline_unix_ms = 8; // 0 => no deadline.
+  SamplingParams sampling = 9;
+  string trace_id        = 10;
+  string span_id         = 11;
+}
+
+message DispatchRequest {
+  InferenceRequest request = 1;
+  Fence            fence   = 2;
+}
+
+message DispatchAck {
+  enum Status {
+    ACCEPTED = 0;  // Engine reserved capacity and will stream ProgressEvents.
+    REJECTED = 1;  // Router must re-route; NO attempt burned, NO reservation held.
+  }
+  Status status  = 1;
+  string reason  = 2;  // e.g. "stale_epoch", "no_kv_blocks", "unknown_model".
+}
+
+// The first item in a successful Dispatch stream is an ack. If ACCEPTED, it is
+// followed by progress items until COMPLETED or FAILED. If REJECTED, the stream
+// ends after the ack. An envelope is necessary because one gRPC method cannot
+// return a separate unary acknowledgement and a server stream.
+message DispatchEvent {
+  oneof payload {
+    DispatchAck   ack      = 1;
+    ProgressEvent progress = 2;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Progress events (Engine -> Router, server-streamed)
+// ---------------------------------------------------------------------------
+
+message ProgressEvent {
+  enum Kind {
+    ADMITTED     = 0;  // Left WAITING_ADMISSION -> PREFILL.
+    PREFILL_DONE = 1;  // PREFILL -> DECODE; TTFT marker.
+    DECODE_STEP  = 2;  // One or more decode iterations completed (batched cadence).
+    PREEMPTED    = 3;  // KV pressure; engine freed blocks, request re-queued for admission.
+    COMPLETED    = 4;  // Terminal; carries the result.
+    FAILED       = 5;  // Terminal-for-this-attempt; Router decides retry vs terminal.
+  }
+  Kind   kind             = 1;
+  string request_id       = 2;
+  Fence  fence            = 3;  // Echoed so the Router can fence stale events.
+  uint32 tokens_generated = 4;
+  string result_ref       = 5;  // Where the output lives (result cache key / blob ref) on COMPLETED.
+  bool   prefix_cache_hit = 6;  // Prefill skipped via shared prefix (§0.6).
+  bool   result_cache_hit = 7;  // Execution skipped entirely (§0.6).
+  string failure_reason   = 8;
+  bool   retryable        = 9;  // Hint for the Router's FAILED_RETRYABLE vs FAILED_TERMINAL decision.
+  string trace_id         = 10;
+  string span_id          = 11;
+}
+
+message CancelRequest {
+  string request_id = 1;
+  Fence  fence      = 2;
+}
+message CancelReply { bool accepted = 1; }
+
+message DrainRequest  { string engine_id = 1; }
+message DrainReply    { uint32 in_flight = 1; }  // Sequences still running; Router waits for these to drain.
+
+// ---------------------------------------------------------------------------
+// Service
+// ---------------------------------------------------------------------------
+
+// Hosted by the Router. Engines register and renew their liveness/capacity.
+service RouterControl {
+  rpc Register  (RegisterRequest)  returns (RegisterReply);
+  rpc Heartbeat (HeartbeatRequest) returns (HeartbeatReply);
+}
+
+// Hosted by each Engine. Routers dispatch and control execution.
+service EngineControl {
+  // The first DispatchEvent is ACCEPTED/REJECTED. ACCEPTED is followed by
+  // progress events until COMPLETED/FAILED; REJECTED ends the stream.
+  rpc Dispatch  (DispatchRequest) returns (stream DispatchEvent);
+
+  rpc Cancel    (CancelRequest)    returns (CancelReply);
+  rpc Drain     (DrainRequest)     returns (DrainReply);
+}

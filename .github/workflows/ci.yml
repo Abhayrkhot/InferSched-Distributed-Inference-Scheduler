@@ -1,0 +1,90 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  hermetic:
+    name: hermetic-${{ matrix.preset }}
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [default, asan, tsan]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install native dependencies
+        run: brew install cmake grpc protobuf abseil libpqxx librdkafka pkg-config
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install -r python/requirements.txt
+
+      - name: Configure and build
+        run: |
+          cmake --preset ${{ matrix.preset }}
+          cmake --build build/${{ matrix.preset }} --parallel
+
+      - name: Test without external services
+        env:
+          ASAN_OPTIONS: abort_on_error=1
+          TSAN_OPTIONS: halt_on_error=1
+        run: ctest --test-dir build/${{ matrix.preset }} -LE live --output-on-failure
+
+  live-infrastructure:
+    name: live-kafka-postgres-redis
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build pkg-config \
+            protobuf-compiler protobuf-compiler-grpc libprotobuf-dev \
+            libgrpc++-dev libabsl-dev libpq-dev librdkafka-dev
+
+      - name: Install libpqxx 8
+        run: |
+          git clone --depth 1 --branch 8.0.1 https://github.com/jtv/libpqxx.git /tmp/libpqxx
+          cmake -S /tmp/libpqxx -B /tmp/libpqxx-build -G Ninja -DSKIP_BUILD_TEST=ON
+          cmake --build /tmp/libpqxx-build --parallel
+          sudo cmake --install /tmp/libpqxx-build
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install -r python/requirements.txt
+
+      - name: Start infrastructure
+        run: |
+          docker compose up -d
+          docker compose ps --wait
+
+      - name: Configure and build
+        run: |
+          cmake --preset default
+          cmake --build build/default --parallel
+
+      - name: Run live integration and chaos tests
+        run: ctest --test-dir build/default -L live --output-on-failure
+
+      - name: Print service logs on failure
+        if: failure()
+        run: docker compose logs
+
+      - name: Stop infrastructure
+        if: always()
+        run: docker compose down -v

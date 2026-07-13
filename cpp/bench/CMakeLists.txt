@@ -1,0 +1,2 @@
+add_executable(infersched_local_bench scheduler_bench.cpp)
+target_link_libraries(infersched_local_bench PRIVATE infersched_core)
