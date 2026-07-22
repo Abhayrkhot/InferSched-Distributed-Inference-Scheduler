@@ -1,0 +1,969 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Interactive system architecture for InferSched, a distributed inference scheduler.">
+  <title>InferSched System Architecture</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #07111f;
+      --panel: #111d30;
+      --panel-2: #17243a;
+      --border: #304561;
+      --text: #f8fafc;
+      --muted: #a9b9cf;
+      --blue: #60a5fa;
+      --purple: #a78bfa;
+      --green: #34d399;
+      --orange: #f59e0b;
+      --max-width: 1500px;
+    }
+
+    * { box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      margin: 0;
+      min-width: 320px;
+      background:
+        radial-gradient(circle at 90% 5%, rgb(37 99 235 / 12%), transparent 28rem),
+        radial-gradient(circle at 5% 95%, rgb(124 58 237 / 10%), transparent 28rem),
+        var(--bg);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.55;
+    }
+
+    a { color: #93c5fd; }
+
+    .shell {
+      width: min(calc(100% - 32px), var(--max-width));
+      margin: 0 auto;
+    }
+
+    header {
+      padding: 54px 0 26px;
+    }
+
+    .eyebrow {
+      margin: 0 0 12px;
+      color: var(--blue);
+      font-size: 0.82rem;
+      font-weight: 800;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(2rem, 5vw, 4.6rem);
+      line-height: 1.02;
+      letter-spacing: -0.045em;
+    }
+
+    .lead {
+      max-width: 850px;
+      margin: 20px 0 0;
+      color: var(--muted);
+      font-size: clamp(1rem, 2vw, 1.25rem);
+    }
+
+    .notice {
+      margin-top: 24px;
+      padding: 15px 18px;
+      border: 1px solid #314967;
+      border-radius: 14px;
+      background: rgb(23 36 58 / 72%);
+      color: #cbd5e1;
+    }
+
+    .viewer {
+      position: relative;
+      overflow: hidden;
+      border: 1px solid var(--border);
+      border-radius: 22px;
+      background: #07111f;
+      box-shadow: 0 24px 70px rgb(0 0 0 / 35%);
+    }
+
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--border);
+      background: var(--panel);
+    }
+
+    .toolbar strong { font-size: 0.95rem; }
+
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    button {
+      padding: 8px 13px;
+      border: 1px solid #425977;
+      border-radius: 10px;
+      background: #1a2a43;
+      color: var(--text);
+      font: inherit;
+      font-size: 0.88rem;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    button:hover,
+    button:focus-visible {
+      border-color: var(--blue);
+      background: #203653;
+      outline: none;
+    }
+
+    .canvas {
+      min-height: 620px;
+      overflow: auto;
+      overscroll-behavior: contain;
+      padding: 26px;
+    }
+
+    .architecture-board {
+      width: 100%;
+      min-width: 1280px;
+      margin: 0 auto;
+      transform-origin: top left;
+      transition: transform 140ms ease;
+    }
+
+    .system-map {
+      display: grid;
+      grid-template-columns: 150px 62px 220px 62px 220px 62px 250px 62px 250px;
+      align-items: center;
+      justify-content: center;
+      padding: 10px 0 28px;
+    }
+
+    .node {
+      position: relative;
+      min-height: 205px;
+      padding: 20px 17px;
+      border: 1px solid #45617f;
+      border-radius: 18px;
+      background: var(--panel-2);
+      box-shadow: 0 14px 32px rgb(0 0 0 / 24%);
+      text-align: center;
+    }
+
+    .node::before {
+      content: attr(data-tier);
+      position: absolute;
+      left: 50%;
+      top: -31px;
+      width: max-content;
+      transform: translateX(-50%);
+      color: #a9b9cf;
+      font-size: 0.7rem;
+      font-weight: 800;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+    }
+
+    .node.client {
+      min-height: 145px;
+      display: grid;
+      place-content: center;
+    }
+
+    .node.gateway-node { background: linear-gradient(145deg, #2563eb, #1d4ed8); border-color: #60a5fa; }
+    .node.router-node { background: linear-gradient(145deg, #7c3aed, #5b21b6); border-color: #a78bfa; }
+    .node.engine-node { background: linear-gradient(145deg, #059669, #047857); border-color: #34d399; }
+
+    .node h3 {
+      margin: 0 0 14px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid rgb(255 255 255 / 24%);
+      font-size: 1.03rem;
+    }
+
+    .node ul {
+      display: grid;
+      gap: 7px;
+      margin: 0;
+      padding: 0;
+      color: #dbeafe;
+      font-size: 0.81rem;
+      list-style: none;
+    }
+
+    .connector {
+      position: relative;
+      height: 3px;
+      background: #7d94b4;
+    }
+
+    .connector::after {
+      content: "";
+      position: absolute;
+      right: -1px;
+      top: 50%;
+      width: 0;
+      height: 0;
+      border-top: 8px solid transparent;
+      border-bottom: 8px solid transparent;
+      border-left: 12px solid #7d94b4;
+      transform: translateY(-50%);
+    }
+
+    .connector span {
+      position: absolute;
+      left: 50%;
+      bottom: 10px;
+      width: 92px;
+      transform: translateX(-50%);
+      color: #cbd5e1;
+      font-size: 0.69rem;
+      font-weight: 750;
+      line-height: 1.25;
+      text-align: center;
+    }
+
+    .return-path {
+      display: grid;
+      grid-template-columns: 1fr auto 1fr;
+      align-items: center;
+      gap: 14px;
+      margin: 0 50px 26px;
+      color: #93c5fd;
+      font-size: 0.76rem;
+      font-weight: 750;
+      text-align: center;
+    }
+
+    .return-path::before,
+    .return-path::after {
+      content: "";
+      height: 1px;
+      background: linear-gradient(90deg, transparent, #60a5fa, transparent);
+    }
+
+    .durability-path {
+      width: max-content;
+      max-width: 90%;
+      margin: 0 auto 12px;
+      padding: 7px 13px;
+      border: 1px solid #f59e0b;
+      border-radius: 999px;
+      background: rgb(180 83 9 / 15%);
+      color: #fcd34d;
+      font-size: 0.74rem;
+      font-weight: 800;
+      text-align: center;
+    }
+
+    .data-plane {
+      display: grid;
+      grid-template-columns: 1.4fr 66px 1fr 66px 0.8fr;
+      align-items: center;
+      gap: 0;
+      width: min(1050px, calc(100% - 70px));
+      margin: 0 auto;
+      padding: 27px;
+      border: 1px solid #334b69;
+      border-radius: 20px;
+      background: #0d192b;
+    }
+
+    .data-node {
+      min-height: 150px;
+      padding: 18px;
+      border: 1px solid #49617e;
+      border-radius: 15px;
+      background: #17243a;
+      text-align: center;
+    }
+
+    .data-node.database-node { border-color: #f59e0b; background: linear-gradient(145deg, #b45309, #92400e); }
+    .data-node h3 { margin: 0 0 10px; font-size: 0.98rem; }
+    .data-node p { margin: 0; color: #dbe5f2; font-size: 0.78rem; }
+
+    .side-note {
+      padding: 8px;
+      color: #94a3b8;
+      font-size: 0.68rem;
+      font-weight: 750;
+      line-height: 1.3;
+      text-align: center;
+    }
+
+    .architecture-rule {
+      margin: 24px 0 0;
+      padding: 12px;
+      border: 1px solid #334b69;
+      border-radius: 12px;
+      background: #16243a;
+      color: #dbeafe;
+      font-size: 0.78rem;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+      text-align: center;
+    }
+
+    .viewer:fullscreen {
+      width: 100vw;
+      height: 100vh;
+      border: 0;
+      border-radius: 0;
+    }
+
+    .viewer:fullscreen .canvas {
+      height: calc(100vh - 58px);
+    }
+
+    section { padding: 65px 0 0; }
+
+    h2 {
+      margin: 0 0 24px;
+      font-size: clamp(1.55rem, 3vw, 2.4rem);
+      letter-spacing: -0.025em;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 18px;
+    }
+
+    .card {
+      padding: 24px;
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      background: rgb(17 29 48 / 86%);
+    }
+
+    .card h3 {
+      margin: 0 0 10px;
+      font-size: 1.08rem;
+    }
+
+    .card p {
+      margin: 0;
+      color: var(--muted);
+    }
+
+    .card.gateway { border-top: 3px solid var(--blue); }
+    .card.router { border-top: 3px solid var(--purple); }
+    .card.engine { border-top: 3px solid var(--green); }
+    .card.database { border-top: 3px solid var(--orange); }
+
+    .flow-list {
+      display: grid;
+      gap: 12px;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+      counter-reset: flow;
+    }
+
+    .flow-list li {
+      position: relative;
+      padding: 18px 20px 18px 68px;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      background: rgb(17 29 48 / 75%);
+      color: var(--muted);
+      counter-increment: flow;
+    }
+
+    .flow-list li::before {
+      content: counter(flow);
+      position: absolute;
+      left: 18px;
+      top: 14px;
+      display: grid;
+      width: 34px;
+      height: 34px;
+      place-items: center;
+      border-radius: 50%;
+      background: #2563eb;
+      color: white;
+      font-weight: 800;
+    }
+
+    .flow-list strong { color: var(--text); }
+
+    .work-breakdown {
+      display: grid;
+      gap: 14px;
+    }
+
+    .work-item {
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      background: rgb(17 29 48 / 86%);
+      overflow: hidden;
+    }
+
+    .work-item summary {
+      display: grid;
+      grid-template-columns: 52px minmax(180px, 0.8fr) minmax(260px, 1.5fr) auto;
+      align-items: center;
+      gap: 16px;
+      padding: 18px 20px;
+      cursor: pointer;
+      list-style: none;
+    }
+
+    .work-item summary::-webkit-details-marker { display: none; }
+
+    .phase-number {
+      display: grid;
+      width: 40px;
+      height: 40px;
+      place-items: center;
+      border-radius: 12px;
+      background: #2563eb;
+      color: white;
+      font-weight: 850;
+    }
+
+    .phase-title { font-weight: 800; }
+    .phase-goal { color: var(--muted); font-size: 0.91rem; }
+
+    .status {
+      padding: 5px 10px;
+      border: 1px solid #1c9b70;
+      border-radius: 999px;
+      background: rgb(5 150 105 / 14%);
+      color: #6ee7b7;
+      font-size: 0.72rem;
+      font-weight: 850;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+
+    .work-body {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 18px;
+      padding: 0 20px 22px 88px;
+      border-top: 1px solid #273c57;
+    }
+
+    .work-body div { padding-top: 17px; }
+    .work-body h4 { margin: 0 0 8px; color: #bfdbfe; font-size: 0.8rem; letter-spacing: 0.05em; text-transform: uppercase; }
+    .work-body p { margin: 0; color: var(--muted); font-size: 0.88rem; }
+    .work-body code { color: #d8b4fe; }
+
+    .guided-order {
+      margin: 0 0 22px;
+      color: var(--muted);
+    }
+
+    .results {
+      width: 100%;
+      overflow-x: auto;
+      border: 1px solid var(--border);
+      border-radius: 18px;
+    }
+
+    table {
+      width: 100%;
+      min-width: 760px;
+      border-collapse: collapse;
+      background: rgb(17 29 48 / 86%);
+    }
+
+    th,
+    td {
+      padding: 15px 18px;
+      border-bottom: 1px solid var(--border);
+      text-align: left;
+    }
+
+    th {
+      background: #17243a;
+      color: #dbeafe;
+      font-size: 0.85rem;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    tr:last-child td { border-bottom: 0; }
+    td:nth-child(3) { color: #86efac; font-weight: 750; }
+
+    footer {
+      padding: 70px 0 45px;
+      color: #8091aa;
+      text-align: center;
+    }
+
+    @media (max-width: 900px) {
+      .grid { grid-template-columns: 1fr 1fr; }
+      .canvas { min-height: 360px; }
+      .work-item summary { grid-template-columns: 48px 1fr auto; }
+      .phase-goal { grid-column: 2 / -1; }
+      .work-body { grid-template-columns: 1fr; padding-left: 84px; }
+    }
+
+    @media (max-width: 620px) {
+      .shell { width: min(calc(100% - 20px), var(--max-width)); }
+      header { padding-top: 34px; }
+      .grid { grid-template-columns: 1fr; }
+      .toolbar { align-items: flex-start; }
+      section { padding-top: 48px; }
+      .work-item summary { grid-template-columns: 44px 1fr; gap: 10px; }
+      .status { grid-column: 2; justify-self: start; }
+      .phase-goal { grid-column: 2; }
+      .work-body { padding: 0 16px 18px; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+      .architecture-board { transition: none; }
+    }
+  </style>
+</head>
+<body>
+  <header class="shell">
+    <p class="eyebrow">Distributed systems and ML infrastructure</p>
+    <h1>InferSched Architecture</h1>
+    <p class="lead">
+      A visual walkthrough of how InferSched accepts inference requests, distributes them across
+      Routers and Engines, schedules continuous batches, and safely recovers from failures.
+    </p>
+    <div class="notice">
+      InferSched simulates model execution with a deterministic cost model. Its measurements describe
+      scheduler behavior and distributed correctness, not real GPU inference throughput.
+    </div>
+  </header>
+
+  <main class="shell">
+    <section aria-labelledby="diagram-title">
+      <h2 id="diagram-title">System overview</h2>
+      <div class="viewer" id="viewer">
+        <div class="toolbar">
+          <strong>InferSched end-to-end request and result path</strong>
+          <div class="controls" aria-label="Diagram controls">
+            <button type="button" id="zoom-out" aria-label="Zoom out">Zoom out</button>
+            <button type="button" id="fit" aria-label="Fit diagram to viewer">Fit</button>
+            <button type="button" id="zoom-in" aria-label="Zoom in">Zoom in</button>
+            <button type="button" id="fullscreen" aria-label="Open diagram fullscreen">Fullscreen</button>
+          </div>
+        </div>
+        <div class="canvas" id="canvas">
+          <div class="architecture-board" id="diagram" role="img" aria-label="InferSched architecture showing the client, FastAPI gateway, Kafka, Router fleet, Engine fleet, PostgreSQL, outbox relay, and Redis.">
+            <div class="system-map">
+              <article class="node client" data-tier="Caller">
+                <h3>Client</h3>
+                <ul>
+                  <li>Application</li>
+                  <li>Open-loop load generator</li>
+                </ul>
+              </article>
+              <div class="connector"><span>HTTP request</span></div>
+              <article class="node gateway-node" data-tier="Control plane">
+                <h3>FastAPI Gateway</h3>
+                <ul>
+                  <li>Validate metadata</li>
+                  <li>Assign request and trace IDs</li>
+                  <li>Bound pending work</li>
+                  <li>Return HTTP 429 on overload</li>
+                </ul>
+              </article>
+              <div class="connector"><span>protobuf publish</span></div>
+              <article class="node" data-tier="Event plane">
+                <h3>Apache Kafka</h3>
+                <ul>
+                  <li>inference.requests</li>
+                  <li>inference.results</li>
+                  <li>inference.dlq</li>
+                  <li>inference.traces</li>
+                </ul>
+              </article>
+              <div class="connector"><span>consumer-group partitions</span></div>
+              <article class="node router-node" data-tier="Coordination tier">
+                <h3>C++ Router Fleet</h3>
+                <ul>
+                  <li>Own Kafka partitions</li>
+                  <li>Acquire durable epochs</li>
+                  <li>Assign execution attempts</li>
+                  <li>Retry and recover work</li>
+                </ul>
+              </article>
+              <div class="connector"><span>streaming gRPC plus fence</span></div>
+              <article class="node engine-node" data-tier="Execution tier">
+                <h3>C++ Engine Fleet</h3>
+                <ul>
+                  <li>Continuous batching</li>
+                  <li>Paged KV allocation</li>
+                  <li>Prefix and result caches</li>
+                  <li>Priority and preemption</li>
+                </ul>
+              </article>
+            </div>
+
+            <div class="return-path">Engine progress and completion return to the Router with the original partition, epoch, and attempt fence</div>
+
+            <div class="durability-path">Router ↕ PostgreSQL: ownership epochs, attempts, recovery, and conditional finalization</div>
+
+            <div class="data-plane" aria-label="Durable state and publication path">
+              <article class="data-node database-node">
+                <h3>PostgreSQL: Source of Truth</h3>
+                <p>Partition ownership epochs, request attempts, lifecycle state, conditional finalization, poison messages, and transactional outbox rows.</p>
+              </article>
+              <div class="connector"><span>committed outbox</span></div>
+              <article class="data-node">
+                <h3>Outbox Relay</h3>
+                <p>Publishes results and DLQ records to Kafka, then marks rows published only after broker acknowledgement.</p>
+              </article>
+              <div class="side-note">Separate, non-authoritative hint store</div>
+              <article class="data-node">
+                <h3>Redis</h3>
+                <p>Disposable lease hints. Flushing Redis cannot change authoritative request state.</p>
+              </article>
+            </div>
+
+            <div class="architecture-rule">Engines own execution · Routers own coordination · Kafka owns transport · PostgreSQL owns truth</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section aria-labelledby="components-title">
+      <h2 id="components-title">Who owns what?</h2>
+      <div class="grid">
+        <article class="card gateway">
+          <h3>FastAPI Gateway</h3>
+          <p>Validates HTTP requests, assigns correlation IDs, applies bounded admission, and returns completed results.</p>
+        </article>
+        <article class="card">
+          <h3>Kafka</h3>
+          <p>Retains request events and divides partitions among Routers through a consumer group.</p>
+        </article>
+        <article class="card router">
+          <h3>Router Fleet</h3>
+          <p>Owns coordination, durable attempts, Engine dispatch, retry, rebalance, and recovery.</p>
+        </article>
+        <article class="card engine">
+          <h3>Engine Fleet</h3>
+          <p>Owns continuous batching, active sequences, paged KV memory, caches, and preemption.</p>
+        </article>
+        <article class="card database">
+          <h3>PostgreSQL</h3>
+          <p>Owns authoritative lifecycle state, ownership epochs, fenced finalization, and the transactional outbox.</p>
+        </article>
+        <article class="card">
+          <h3>Redis</h3>
+          <p>Holds disposable coordination hints. Losing Redis cannot corrupt authoritative request state.</p>
+        </article>
+      </div>
+    </section>
+
+    <section aria-labelledby="flow-title">
+      <h2 id="flow-title">How one request moves through the system</h2>
+      <ol class="flow-list">
+        <li><strong>Accept:</strong> FastAPI validates the request, assigns request and trace IDs, and publishes protobuf to Kafka.</li>
+        <li><strong>Assign:</strong> Kafka gives the request partition to exactly one active Router in the consumer group.</li>
+        <li><strong>Fence:</strong> The Router records the request in PostgreSQL and obtains a partition epoch and attempt ID.</li>
+        <li><strong>Execute:</strong> The Router dispatches over gRPC. The Engine continuously batches the request and manages its KV pages.</li>
+        <li><strong>Finalize:</strong> PostgreSQL accepts the completion only when the partition, epoch, Engine, attempt, and state are current.</li>
+        <li><strong>Publish:</strong> The result and outbox row commit together. The relay publishes to Kafka after the database transaction.</li>
+        <li><strong>Return:</strong> The gateway correlates the Kafka result with the waiting HTTP request and returns it to the client.</li>
+      </ol>
+    </section>
+
+    <section aria-labelledby="work-title">
+      <h2 id="work-title">Guided implementation breakdown</h2>
+      <p class="guided-order">
+        Follow these stages in order when learning, presenting, or extending the project. Each stage
+        depends on the correctness boundary established by the stage before it. Expand a stage to see
+        its objective, the implementation to inspect, and the evidence that proves it works.
+      </p>
+
+      <div class="work-breakdown">
+        <details class="work-item" open>
+          <summary>
+            <span class="phase-number">0</span>
+            <span class="phase-title">Foundation and contracts</span>
+            <span class="phase-goal">Define the build, request schema, service boundaries, and test configurations.</span>
+            <span class="status">Implemented</span>
+          </summary>
+          <div class="work-body">
+            <div>
+              <h4>Understand</h4>
+              <p>The protobuf contract separates Router coordination from Engine execution. CMake provides default, ASan, and TSan configurations.</p>
+            </div>
+            <div>
+              <h4>Read</h4>
+              <p><code>proto/infersched.proto</code>, <code>CMakePresets.json</code>, and <code>cpp/CMakeLists.txt</code>.</p>
+            </div>
+            <div>
+              <h4>Evidence</h4>
+              <p>The same request, fence, dispatch, progress, cancellation, registration, and heartbeat messages are used by integration tests and real processes.</p>
+            </div>
+          </div>
+        </details>
+
+        <details class="work-item">
+          <summary>
+            <span class="phase-number">1</span>
+            <span class="phase-title">Deterministic Engine core</span>
+            <span class="phase-goal">Build correct lifecycle, batching, cache, KV-allocation, and simulated-time primitives.</span>
+            <span class="status">Implemented</span>
+          </summary>
+          <div class="work-body">
+            <div>
+              <h4>Understand</h4>
+              <p>Requests move through explicit states. The deterministic runner advances a fake clock using a reproducible prefill and decode cost model.</p>
+            </div>
+            <div>
+              <h4>Read</h4>
+              <p><code>execution_state.cpp</code>, <code>deterministic_engine.cpp</code>, <code>cost_model.cpp</code>, and <code>paged_kv_cache.cpp</code>.</p>
+            </div>
+            <div>
+              <h4>Evidence</h4>
+              <p>Transactional allocation, reference counts, state transitions, cache keys, impossible-request rejection, and zero-leak invariants have focused tests.</p>
+            </div>
+          </div>
+        </details>
+
+        <details class="work-item">
+          <summary>
+            <span class="phase-number">2</span>
+            <span class="phase-title">Continuous batching and KV pressure</span>
+            <span class="phase-goal">Admit new work between decode iterations and remain correct when memory fills.</span>
+            <span class="status">Implemented</span>
+          </summary>
+          <div class="work-body">
+            <div>
+              <h4>Understand</h4>
+              <p>The scheduler admits ready requests, reuses prefixes, grows decode pages, evicts cache entries, and preempts lower-value work when necessary.</p>
+            </div>
+            <div>
+              <h4>Read</h4>
+              <p><code>continuous_engine.cpp</code>, <code>request_queue.cpp</code>, <code>radix_prefix_cache.cpp</code>, and <code>result_cache.cpp</code>.</p>
+            </div>
+            <div>
+              <h4>Evidence</h4>
+              <p>Seeded workloads verify mid-decode admission, true shared prefixes across different prompts, completion despite preemption, and zero KV leakage.</p>
+            </div>
+          </div>
+        </details>
+
+        <details class="work-item">
+          <summary>
+            <span class="phase-number">3</span>
+            <span class="phase-title">Concurrency and scheduler benchmarks</span>
+            <span class="phase-goal">Remove scale bottlenecks and measure scheduler overhead without mislabeling it as GPU throughput.</span>
+            <span class="status">Implemented</span>
+          </summary>
+          <div class="work-body">
+            <div>
+              <h4>Understand</h4>
+              <p>A heap-backed request queue and sharded registry replace avoidable global or quadratic paths. Candidate optimizations are kept only when measurements justify them.</p>
+            </div>
+            <div>
+              <h4>Read</h4>
+              <p><code>request_queue.hpp</code>, <code>sharded_registry.hpp</code>, <code>mpsc_ring.hpp</code>, and <code>scheduler_bench.cpp</code>.</p>
+            </div>
+            <div>
+              <h4>Evidence</h4>
+              <p>The 100,000-request CPU path completes with zero leaks. TSan verifies concurrency, and the slower lock-free queue is documented as a rejected optimization.</p>
+            </div>
+          </div>
+        </details>
+
+        <details class="work-item">
+          <summary>
+            <span class="phase-number">4</span>
+            <span class="phase-title">Real process distribution</span>
+            <span class="phase-goal">Run Routers and Engines as separate processes with a stable network protocol.</span>
+            <span class="status">Implemented</span>
+          </summary>
+          <div class="work-body">
+            <div>
+              <h4>Understand</h4>
+              <p>Routers host registration and heartbeat RPCs. Engines host dispatch, cancel, and drain RPCs. Dispatch streams acknowledgement and progress events.</p>
+            </div>
+            <div>
+              <h4>Read</h4>
+              <p><code>router_service.cpp</code>, <code>engine_service.cpp</code>, <code>router_main.cpp</code>, and <code>engine_main.cpp</code>.</p>
+            </div>
+            <div>
+              <h4>Evidence</h4>
+              <p>Process tests cover concurrent dispatch, stale epoch and attempt rejection, same-Engine overlap rejection, SIGKILL, replacement, and drain.</p>
+            </div>
+          </div>
+        </details>
+
+        <details class="work-item">
+          <summary>
+            <span class="phase-number">5</span>
+            <span class="phase-title">Durable at-least-once pipeline</span>
+            <span class="phase-goal">Make PostgreSQL authoritative and publish accepted results without an unsafe dual write.</span>
+            <span class="status">Implemented</span>
+          </summary>
+          <div class="work-body">
+            <div>
+              <h4>Understand</h4>
+              <p>Idempotent ingestion tolerates Kafka redelivery. Conditional finalization accepts only the current fence. A transactional outbox connects database state to Kafka publication.</p>
+            </div>
+            <div>
+              <h4>Read</h4>
+              <p><code>durable_store.cpp</code>, <code>request_ingestor.cpp</code>, <code>outbox_relay.cpp</code>, <code>offset_tracker.cpp</code>, and <code>durable_router_main.cpp</code>.</p>
+            </div>
+            <div>
+              <h4>Evidence</h4>
+              <p>Live Kafka and PostgreSQL tests prove duplicate handling, poison-to-DLQ publication, one accepted result, restart recovery, broker acknowledgement, and safe contiguous offsets.</p>
+            </div>
+          </div>
+        </details>
+
+        <details class="work-item">
+          <summary>
+            <span class="phase-number">6</span>
+            <span class="phase-title">Multi-Router rebalance and recovery</span>
+            <span class="phase-goal">Scale coordination by Kafka partitions while fencing late work after ownership changes.</span>
+            <span class="status">Implemented</span>
+          </summary>
+          <div class="work-body">
+            <div>
+              <h4>Understand</h4>
+              <p>Kafka decides assignment, while PostgreSQL decides authority. New owners increment partition epochs, recover unresolved requests, and create new attempts.</p>
+            </div>
+            <div>
+              <h4>Read</h4>
+              <p><code>kafka_poller.cpp</code>, <code>durable_router_main.cpp</code>, and <code>docs/p6-multi-router-rebalancing.md</code>.</p>
+            </div>
+            <div>
+              <h4>Evidence</h4>
+              <p>Chaos tests kill a Router and Engine, trigger consumer-group rebalance, flush Redis, and still require all authoritative results to complete exactly once in PostgreSQL.</p>
+            </div>
+          </div>
+        </details>
+
+        <details class="work-item">
+          <summary>
+            <span class="phase-number">7</span>
+            <span class="phase-title">Control plane, observability, and evidence</span>
+            <span class="phase-goal">Expose the system through HTTP and measure overload, latency, utilization, caches, and the full distributed path.</span>
+            <span class="status">Implemented</span>
+          </summary>
+          <div class="work-body">
+            <div>
+              <h4>Understand</h4>
+              <p>The gateway bounds pending work, publishes protobuf, consumes results, correlates traces, and reports metrics. Open-loop load arrives independently of completions.</p>
+            </div>
+            <div>
+              <h4>Read</h4>
+              <p><code>python/infersched_api/app.py</code>, <code>python/loadgen.py</code>, <code>histogram.cpp</code>, and <code>docs/benchmarks.md</code>.</p>
+            </div>
+            <div>
+              <h4>Evidence</h4>
+              <p>Tests cover HTTP 429 and the live FastAPI path. Reproducible baselines report bucketed latency, utilization, cache hit rates, completion, and zero KV leaks.</p>
+            </div>
+          </div>
+        </details>
+      </div>
+    </section>
+
+    <section aria-labelledby="results-title">
+      <h2 id="results-title">Measured results</h2>
+      <div class="results">
+        <table>
+          <thead>
+            <tr>
+              <th>Experiment</th>
+              <th>Workload</th>
+              <th>Observed result</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Scheduler CPU microbenchmark</td>
+              <td>100,000 requests, simulated compute disabled</td>
+              <td>732,310 scheduler req/s</td>
+            </tr>
+            <tr>
+              <td>Open-loop cost simulation</td>
+              <td>10,000 requests at 750 offered QPS</td>
+              <td>750.9 QPS and 78.0% utilization</td>
+            </tr>
+            <tr>
+              <td>Open-loop latency</td>
+              <td>Same 750-QPS workload</td>
+              <td>Approximately 65 ms bucketed E2E p99</td>
+            </tr>
+            <tr>
+              <td>Large correctness run</td>
+              <td>100,000 requests at 750 QPS</td>
+              <td>100% complete and zero KV leaks</td>
+            </tr>
+            <tr>
+              <td>Controlled cache comparison</td>
+              <td>250 offered QPS</td>
+              <td>E2E p99 reduced from 8.2 ms to 2.0 ms</td>
+            </tr>
+            <tr>
+              <td>Live distributed integration path</td>
+              <td>100 requests at 50 offered QPS</td>
+              <td>46.5 achieved QPS and 125.6 ms p99</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="notice">
+        Percentiles use power-of-two histogram bucket upper bounds. The live distributed measurement
+        is an integration baseline, not a horizontal scaling curve. See <a href="https://github.com/Abhayrkhot/InferSched-Distributed-Inference-Scheduler/blob/main/docs/benchmarks.md">the
+        benchmark report</a> for methodology and claim boundaries.
+      </p>
+    </section>
+  </main>
+
+  <footer class="shell">
+    Engines own execution. Routers own coordination. Kafka owns transport. PostgreSQL owns truth.
+  </footer>
+
+  <script>
+    const viewer = document.getElementById("viewer");
+    const diagram = document.getElementById("diagram");
+    const canvas = document.getElementById("canvas");
+    let zoom = 1;
+
+    function renderZoom() {
+      diagram.style.zoom = zoom;
+    }
+
+    document.getElementById("zoom-in").addEventListener("click", () => {
+      zoom = Math.min(2.5, zoom + 0.2);
+      renderZoom();
+    });
+
+    document.getElementById("zoom-out").addEventListener("click", () => {
+      zoom = Math.max(0.6, zoom - 0.2);
+      renderZoom();
+    });
+
+    document.getElementById("fit").addEventListener("click", () => {
+      zoom = 1;
+      canvas.scrollTo({ left: 0, top: 0, behavior: "smooth" });
+      renderZoom();
+    });
+
+    document.getElementById("fullscreen").addEventListener("click", async () => {
+      if (!document.fullscreenElement) {
+        await viewer.requestFullscreen();
+      } else {
+        await document.exitFullscreen();
+      }
+    });
+  </script>
+</body>
+</html>
