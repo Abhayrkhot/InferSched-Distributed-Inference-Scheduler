@@ -114,10 +114,92 @@ build/default/cpp/bench/infersched_local_bench --mode open_loop \
   --requests 10000 --qps 750 --seed 7 --cache none --telemetry enabled
 ```
 
-## P7 distributed end-to-end baseline
+## P7 distributed end-to-end baseline (historical, serial Router)
 
 The separate live suite covers HTTP → FastAPI → Kafka → serial durable Router → gRPC Engine →
 PostgreSQL/result outbox → Kafka → FastAPI. On the same machine, 100 open-loop requests at 50 offered
 QPS completed without rejection at 46.5 achieved QPS and 125.6 ms e2e p99. A 100-request closed-loop
 run achieved 30.9 QPS and 60.7 ms p99. These are small integration baselines, not the 100,000-request
 scheduler result and not a distributed scaling curve.
+
+These numbers are superseded by the P8 section below. They were measured with a single-process
+load generator that serialized submissions and busy-polled results; P8 found that this tooling
+saturates its own CPU near 100 req/s, so the historical figures bound the tooling as much as the
+system.
+
+## P8 distributed path: snapshot 2026-11-19
+
+What changed between the two snapshots is described in
+[`p8-multi-engine-routing.md`](p8-multi-engine-routing.md): concurrent dispatch across an Engine
+fleet, continuous admission across RPCs, batched Router ingest, and corrected load-generation
+methodology.
+
+Environment (different from the Apple M4 snapshot above):
+
+- Host: Intel Core i7-12700H (20 logical CPUs), 61 GiB RAM, Ubuntu 26.04, kernel 7.0.
+- Shared host: other unrelated workloads (Kubernetes-in-Docker clusters, Terraform runs) were active
+  during measurement. Load average is recorded per run; numbers were taken at load average 2–6
+  on 20 CPUs. Treat tails as noisy.
+- Runtime container: Ubuntu 24.04, GCC 13.3, gRPC 1.51, librdkafka 2.3, hiredis 1.2, libpqxx 8.0.1,
+  Python 3.12. Kafka 3.7.2 (KRaft, one broker), PostgreSQL 16.16 with default `synchronous_commit`,
+  Redis 7, all via `docker compose` on the same host.
+- Engines run the cost model with zero simulated compute plus `--batch-delay-ms 2` per iteration,
+  so each request spends roughly 10–70 ms in decode (4–32 output tokens). This is a scheduling and
+  coordination benchmark, not model inference.
+
+### Router throughput, before and after
+
+A C++ client publishes a burst of requests straight to Kafka and waits for every result
+(`scripts/run_router_burst.sh BIN_DIR ENGINES COUNT`: one durable Router, Engines with zero simulated
+compute, so this measures the Router/Kafka/Postgres/gRPC coordination path alone). The before row
+used the original client, which publishes one acknowledged message at a time; that client is not
+the bottleneck at 68 req/s.
+
+| Build | Engines | Requests | Wall time | Throughput |
+|---|---:|---:|---:|---:|
+| Before P8 (commit `9d22bd6`, serial dispatch) | 1 | 1,000 | 14.6 s | 68 req/s |
+| P8 | 1 | 5,000 | 3.42 s | 1,460 req/s |
+| P8 | 2 | 5,000 | 3.47 s | 1,439 req/s |
+| P8 | 4 | 5,000 | 3.47 s | 1,440 req/s |
+
+Two trials of the before row gave 68 req/s both times. Wall time includes client start-up and
+consumer-group join. With zero compute, adding Engines does not help: the Router's main thread
+(Kafka ingest, outbox relay, offset commits) and Postgres commits are the bound.
+
+### Full HTTP path (gateway → Kafka → Router → 2 Engines → Postgres → Kafka → gateway)
+
+`scripts/run_p7_distributed_bench.sh REQUESTS open QPS` with the defaults: one Router (128 dispatch
+workers, 16 Postgres connections), two Engines, Poisson arrivals, 50 unmeasured warm-up requests,
+and client load split across processes (no client saturated its CPU in any row). Latency is
+client-observed (POST → result), exact percentiles over all completed requests.
+
+| Offered QPS | Requests | Achieved QPS | e2e p50 | e2e p90 | e2e p99 | Submit p99 | Errors |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 100 | 3,000 | 98.8 | 51.4 ms | 75.0 ms | 86.9 ms | 10.7 ms | 0 |
+| 300 | 3,000 | 278.6 | 54.3 ms | 80.1 ms | 94.0 ms | 11.7 ms | 0 |
+| 600 | 6,000 | 558.4 | 58.2 ms | 84.3 ms | 97.7 ms | 12.9 ms | 0 |
+| 800 | 6,000 | 712.1 | 313.1 ms | 456.6 ms | 498.4 ms | 40.1 ms | 0 |
+
+The 800-QPS row is past saturation (queueing visible in p50), so this configuration sustains
+roughly 600–700 QPS end to end. Router-side spans at that point show dispatch itself unchanged
+(p50 ≈ 40 ms); the queueing is in front of the Router (single gateway process plus Router ingest).
+Achieved QPS is completions divided by the whole window, including the final requests' latency, so
+it reads slightly below the offered rate even when nothing queues.
+
+Per-stage breakdown from `inference.traces` at 100 offered QPS (1,000 requests, before the warm-up
+was added, which is why p99 ingest is high: those are the first requests after assignment):
+
+| Span | p50 | p90 | p99 |
+|---|---:|---:|---:|
+| `gateway.submit_ack` (admission → broker ack) | 1.6 ms | 2.4 ms | 3.4 ms |
+| `router.ingest` (CreateTime → enqueued) | 3.8 ms | 8.7 ms | 356 ms |
+| `router.dispatch` (one attempt on an Engine) | 36.7 ms | 60.6 ms | 66.9 ms |
+| `router.request` (enqueued → finalized) | 41.6 ms | 66.5 ms | 132 ms |
+| `gateway.result_transit` (outbox publish → gateway) | 2.3 ms | 2.9 ms | 4.2 ms |
+
+### What these numbers do not show
+
+- No GPU or model execution; Engine time is a fixed per-iteration delay.
+- One Router and one gateway process on one host. This is not a horizontal scaling curve; adding
+  Engines raises dispatch capacity but not the gateway or Router-ingest ceiling.
+- Shared-host noise affects tails. Re-run on a dedicated machine before quoting a p99.

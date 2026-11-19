@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Unique per run even inside a fresh container, where $$ repeats.
+uid="$$-${RANDOM}${RANDOM}"
 
 router_binary="${1:?durable router binary required}"
 engine_binary="${2:?engine binary required}"
 client_binary="${3:?client binary required}"
-group="infersched-p6-chaos-$$"
-marker="${TMPDIR:-/tmp}/infersched-p6-published-$$"
-router1_log="${TMPDIR:-/tmp}/infersched-p6-router1-$$.log"
-router2_log="${TMPDIR:-/tmp}/infersched-p6-router2-$$.log"
-ready1="${TMPDIR:-/tmp}/infersched-p6-router1-ready-$$"
-ready2="${TMPDIR:-/tmp}/infersched-p6-router2-ready-$$"
+group="infersched-p6-chaos-${uid}"
+marker="${TMPDIR:-/tmp}/infersched-p6-published-${uid}"
+router1_log="${TMPDIR:-/tmp}/infersched-p6-router1-${uid}.log"
+router2_log="${TMPDIR:-/tmp}/infersched-p6-router2-${uid}.log"
+ready1="${TMPDIR:-/tmp}/infersched-p6-router1-ready-${uid}"
+ready2="${TMPDIR:-/tmp}/infersched-p6-router2-ready-${uid}"
 rm -f "${ready1}" "${ready2}"
 
 pids=()

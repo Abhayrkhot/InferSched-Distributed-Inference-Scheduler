@@ -85,6 +85,30 @@ std::optional<EngineRecord> RouterService::WaitForNewIncarnation(
   return std::nullopt;
 }
 
+std::vector<EngineRecord> RouterService::LiveEngines() {
+  std::lock_guard lock(mutex_);
+  PruneExpiredLocked();
+  std::vector<EngineRecord> engines;
+  engines.reserve(engines_.size());
+  for (const auto& [engine_id, engine] : engines_) {
+    static_cast<void>(engine_id);
+    engines.push_back(engine);
+  }
+  return engines;
+}
+
+std::vector<EngineRecord> RouterService::WaitForLiveEngines(
+    const std::chrono::milliseconds timeout) {
+  {
+    std::unique_lock lock(mutex_);
+    static_cast<void>(registered_.wait_for(lock, timeout, [&] {
+      PruneExpiredLocked();
+      return !engines_.empty();
+    }));
+  }
+  return LiveEngines();
+}
+
 void RouterService::PruneExpiredLocked() {
   const auto now = std::chrono::steady_clock::now();
   std::erase_if(engines_, [&](const auto& entry) {

@@ -5,14 +5,22 @@
 #include <utility>
 
 namespace infersched::distributed {
+namespace {
+
+constexpr auto kStreamPollInterval = std::chrono::milliseconds(50);
+constexpr auto kStallWait = std::chrono::milliseconds(1);
+
+bool RetryableFailure(const std::string& reason) {
+  return reason == "superseded" || reason == "client_cancelled" ||
+         reason == "engine_stopping";
+}
+
+}  // namespace
 
 EngineService::EngineService(engine::EngineConfig config,
-                             const std::size_t queue_capacity,
-                             const std::chrono::milliseconds processing_delay)
-    : queue_capacity_(queue_capacity), processing_delay_(processing_delay),
-      engine_(config),
-      total_kv_blocks_(config.kv_blocks), free_kv_blocks_(config.kv_blocks),
-      worker_(&EngineService::WorkerLoop, this) {}
+                             EngineServiceOptions options)
+    : config_(config), options_(options), free_kv_blocks_(config.kv_blocks),
+      engine_(config), worker_(&EngineService::WorkerLoop, this) {}
 
 EngineService::~EngineService() {
   {
@@ -26,7 +34,6 @@ EngineService::~EngineService() {
 grpc::Status EngineService::Dispatch(
     grpc::ServerContext* context, const v1::DispatchRequest* request,
     grpc::ServerWriter<v1::DispatchEvent>* writer) {
-  static_cast<void>(context);
   auto job = std::make_shared<Job>();
   job->dispatch = *request;
   const std::string rejection = ValidateAndReserve(*request, job);
@@ -40,15 +47,39 @@ grpc::Status EngineService::Dispatch(
     return grpc::Status::OK;
   }
   ack->set_status(v1::DispatchAck::ACCEPTED);
+  const std::string& request_id = request->request().request_id();
   if (!writer->Write(acknowledgement)) {
+    RequestCancel(request_id, "client_cancelled");
     return grpc::Status(grpc::StatusCode::CANCELLED, "ack stream closed");
   }
 
-  std::unique_lock lock(job->mutex);
-  job->ready.wait(lock, [&] { return job->done; });
-  lock.unlock();
-  WriteProgress(*job, *writer);
-  return grpc::Status::OK;
+  // Stream progress at the Engine's own cadence until the attempt is terminal.
+  while (true) {
+    std::deque<v1::DispatchEvent> batch;
+    bool done = false;
+    {
+      std::unique_lock lock(job->mutex);
+      job->changed.wait_for(lock, kStreamPollInterval,
+                            [&] { return job->done || !job->events.empty(); });
+      batch.swap(job->events);
+      done = job->done;
+    }
+    for (const auto& event : batch) {
+      if (!writer->Write(event)) {
+        RequestCancel(request_id, "client_cancelled");
+        return grpc::Status(grpc::StatusCode::CANCELLED, "progress stream closed");
+      }
+    }
+    if (done) {
+      return grpc::Status::OK;
+    }
+    if (context != nullptr && context->IsCancelled()) {
+      // Router deadline or explicit TryCancel: free the sequence's KV now
+      // instead of finishing work nobody will accept.
+      RequestCancel(request_id, "client_cancelled");
+      return grpc::Status(grpc::StatusCode::CANCELLED, "dispatch cancelled");
+    }
+  }
 }
 
 grpc::Status EngineService::Cancel(grpc::ServerContext* context,
@@ -57,12 +88,15 @@ grpc::Status EngineService::Cancel(grpc::ServerContext* context,
   static_cast<void>(context);
   std::lock_guard lock(mutex_);
   const auto iterator = live_jobs_.find(request->request_id());
-  const auto job = iterator == live_jobs_.end() ? nullptr : iterator->second.lock();
-  if (job && job->dispatch.fence().ownership_epoch() ==
-                 request->fence().ownership_epoch() &&
-      job->dispatch.fence().attempt_id() == request->fence().attempt_id()) {
-    job->superseded.store(true, std::memory_order_release);
-    reply->set_accepted(true);
+  if (iterator != live_jobs_.end()) {
+    const auto& fence = iterator->second->dispatch.fence();
+    if (fence.ownership_epoch() == request->fence().ownership_epoch() &&
+        fence.attempt_id() == request->fence().attempt_id()) {
+      iterator->second->superseded.store(true, std::memory_order_release);
+      cancels_.emplace_back(request->request_id(), "superseded");
+      reply->set_accepted(true);
+      work_ready_.notify_one();
+    }
   }
   return grpc::Status::OK;
 }
@@ -74,136 +108,258 @@ grpc::Status EngineService::Drain(grpc::ServerContext* context,
   static_cast<void>(request);
   std::unique_lock lock(mutex_);
   draining_ = true;
-  drained_.wait(lock, [&] { return queue_.empty() && running_jobs_ == 0; });
+  drained_.wait(lock, [&] { return outstanding_ == 0; });
   reply->set_in_flight(0);
   return grpc::Status::OK;
 }
 
 v1::EngineCapacity EngineService::Capacity() const {
-  std::lock_guard lock(mutex_);
+  std::size_t outstanding = 0;
+  std::size_t incoming = 0;
+  {
+    std::lock_guard lock(mutex_);
+    outstanding = outstanding_;
+    incoming = incoming_.size();
+  }
   v1::EngineCapacity capacity;
-  capacity.set_total_kv_blocks(
-      static_cast<std::uint32_t>(total_kv_blocks_));
-  capacity.set_free_kv_blocks(
-      static_cast<std::uint32_t>(free_kv_blocks_.load(std::memory_order_relaxed)));
-  capacity.set_running_seqs(static_cast<std::uint32_t>(running_jobs_));
-  capacity.set_waiting_seqs(static_cast<std::uint32_t>(queue_.size()));
+  capacity.set_total_kv_blocks(static_cast<std::uint32_t>(config_.kv_blocks));
+  capacity.set_free_kv_blocks(static_cast<std::uint32_t>(
+      free_kv_blocks_.load(std::memory_order_relaxed)));
+  capacity.set_running_seqs(static_cast<std::uint32_t>(
+      running_seqs_.load(std::memory_order_relaxed)));
+  capacity.set_waiting_seqs(static_cast<std::uint32_t>(
+      waiting_seqs_.load(std::memory_order_relaxed) + incoming));
   capacity.set_batch_headroom(static_cast<std::uint32_t>(
-      queue_capacity_ > queue_.size() ? queue_capacity_ - queue_.size() : 0));
+      options_.queue_capacity > outstanding ? options_.queue_capacity - outstanding
+                                            : 0));
   return capacity;
+}
+
+EngineService::Stats EngineService::stats() const {
+  std::lock_guard lock(mutex_);
+  return stats_;
 }
 
 std::string EngineService::ValidateAndReserve(
     const v1::DispatchRequest& request, const std::shared_ptr<Job>& job) {
   std::lock_guard lock(mutex_);
-  if (draining_) {
-    return "draining";
+  const auto reject = [&](std::string reason) {
+    ++stats_.rejected;
+    return reason;
+  };
+  if (draining_ || stop_) {
+    return reject("draining");
   }
-  if (queue_.size() >= queue_capacity_) {
-    return "queue_full";
+  if (outstanding_ >= options_.queue_capacity) {
+    return reject("queue_full");
   }
   const auto partition = request.fence().partition_id();
   const auto epoch = request.fence().ownership_epoch();
   const auto current_epoch = partition_epochs_.find(partition);
   if (current_epoch != partition_epochs_.end() && epoch < current_epoch->second) {
-    return "stale_ownership_epoch";
+    return reject("stale_ownership_epoch");
   }
   partition_epochs_[partition] = epoch;
 
+  const std::string& request_id = request.request().request_id();
   const auto attempt = request.fence().attempt_id();
-  const auto current_attempt = request_attempts_.find(request.request().request_id());
+  const auto current_attempt = request_attempts_.find(request_id);
   if (current_attempt != request_attempts_.end() &&
       attempt <= current_attempt->second) {
-    return "stale_or_duplicate_attempt";
+    return reject("stale_or_duplicate_attempt");
   }
-  const auto live = live_jobs_.find(request.request().request_id());
-  if (live != live_jobs_.end() && !live->second.expired()) {
-    // ContinuousEngine requires one live sequence per request id. P4 rejects an
-    // overlapping retry without advancing its fence; P5 may reroute it to a
-    // different Engine or retry after the current attempt becomes terminal.
-    return "request_already_in_flight";
+  if (live_jobs_.contains(request_id)) {
+    // ContinuousEngine holds one live sequence per request id. An overlapping
+    // retry is rejected without advancing the fence; the Router reroutes it
+    // or retries after the current attempt becomes terminal.
+    return reject("request_already_in_flight");
   }
-  request_attempts_[request.request().request_id()] = attempt;
-  live_jobs_[request.request().request_id()] = job;
-  queue_.push_back(job);
+  RememberAttempt(request_id, attempt);
+  live_jobs_.emplace(request_id, job);
+  incoming_.push_back(job);
+  ++outstanding_;
+  ++stats_.accepted;
   work_ready_.notify_one();
   return {};
 }
 
-void EngineService::WorkerLoop() {
-  while (true) {
-    std::vector<std::shared_ptr<Job>> batch;
-    {
-      std::unique_lock lock(mutex_);
-      work_ready_.wait(lock, [&] { return stop_ || !queue_.empty(); });
-      if (stop_ && queue_.empty()) {
-        return;
-      }
-      // Briefly coalesce concurrent RPCs into one continuous-batching run.
-      lock.unlock();
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      lock.lock();
-      while (!queue_.empty()) {
-        batch.push_back(std::move(queue_.front()));
-        queue_.pop_front();
-      }
-      running_jobs_ += batch.size();
-    }
-
-    const std::size_t result_offset = engine_.results().size();
-    for (const auto& job : batch) {
-      engine_.Submit(ToEngineRequest(job->dispatch.request()));
-    }
-    if (processing_delay_ > std::chrono::milliseconds::zero()) {
-      std::this_thread::sleep_for(processing_delay_);
-    }
-    engine_.RunUntilIdle();
-    free_kv_blocks_.store(engine_.kv_cache().free_blocks(),
-                          std::memory_order_relaxed);
-
-    std::unordered_map<std::string, engine::EngineResult> new_results;
-    for (std::size_t index = result_offset; index < engine_.results().size(); ++index) {
-      new_results.insert_or_assign(engine_.results()[index].request_id,
-                                   engine_.results()[index]);
-    }
-    for (const auto& job : batch) {
-      std::lock_guard job_lock(job->mutex);
-      const auto result = new_results.find(job->dispatch.request().request_id());
-      if (result == new_results.end()) {
-        job->result = engine::EngineResult{
-            .request_id = job->dispatch.request().request_id(),
-            .succeeded = false,
-            .failure_reason = "missing_engine_result"};
-      } else {
-        job->result = result->second;
-      }
-      if (job->superseded.load(std::memory_order_acquire)) {
-        job->result.succeeded = false;
-        job->result.failure_reason = "superseded";
-      }
-      job->done = true;
-      job->ready.notify_all();
-    }
-
-    {
-      std::lock_guard lock(mutex_);
-      running_jobs_ -= batch.size();
-      for (const auto& job : batch) {
-        const auto iterator = live_jobs_.find(job->dispatch.request().request_id());
-        if (iterator != live_jobs_.end() && iterator->second.lock() == job) {
-          live_jobs_.erase(iterator);
-        }
-      }
-      if (queue_.empty() && running_jobs_ == 0) {
-        drained_.notify_all();
-      }
-    }
+void EngineService::RememberAttempt(const std::string& request_id,
+                                    const std::uint64_t attempt) {
+  const auto [iterator, inserted] = request_attempts_.insert_or_assign(request_id, attempt);
+  static_cast<void>(iterator);
+  if (!inserted) {
+    return;
+  }
+  attempt_order_.push_back(request_id);
+  // Forgetting a live request's fence is safe: live_jobs_ still rejects an
+  // overlapping dispatch, and Postgres rejects any stale completion.
+  while (attempt_order_.size() > options_.fence_memory) {
+    request_attempts_.erase(attempt_order_.front());
+    attempt_order_.pop_front();
   }
 }
 
+void EngineService::RequestCancel(const std::string& request_id,
+                                  std::string reason) {
+  {
+    std::lock_guard lock(mutex_);
+    cancels_.emplace_back(request_id, std::move(reason));
+  }
+  work_ready_.notify_one();
+}
+
+void EngineService::WorkerLoop() {
+  // Worker-owned map from engine request id to its RPC-side job.
+  std::unordered_map<std::string, std::shared_ptr<Job>> running;
+  std::deque<std::shared_ptr<Job>> unstarted;
+  while (true) {
+    std::deque<std::shared_ptr<Job>> incoming;
+    std::deque<std::pair<std::string, std::string>> cancels;
+    {
+      std::unique_lock lock(mutex_);
+      work_ready_.wait(lock, [&] {
+        return stop_ || !incoming_.empty() || !cancels_.empty() || !engine_.idle();
+      });
+      if (stop_) {
+        unstarted.swap(incoming_);
+        break;
+      }
+      incoming.swap(incoming_);
+      cancels.swap(cancels_);
+    }
+
+    // New requests join the live batch at this iteration boundary.
+    for (auto& job : incoming) {
+      engine::EngineRequest request = ToEngineRequest(job->dispatch.request());
+      request.arrival_time = engine_.clock().Now();
+      running.insert_or_assign(request.request_id, job);
+      engine_.Submit(std::move(request));
+    }
+    incoming.clear();
+    for (const auto& [request_id, reason] : cancels) {
+      static_cast<void>(engine_.Cancel(request_id, reason));
+    }
+
+    const auto simulated_before = engine_.clock().Now();
+    const bool progressed = engine_.RunOneIteration();
+    const auto simulated = engine_.clock().Now() - simulated_before;
+
+    // Publish capacity before results so anyone woken by a terminal event
+    // already sees the freed sequence and KV blocks.
+    free_kv_blocks_.store(engine_.kv_cache().free_blocks(), std::memory_order_relaxed);
+    running_seqs_.store(engine_.active_count(), std::memory_order_relaxed);
+    waiting_seqs_.store(engine_.pending_count(), std::memory_order_relaxed);
+
+    for (const auto& request_id : engine_.TakeFirstTokens()) {
+      const auto job = running.find(request_id);
+      if (job == running.end()) {
+        continue;
+      }
+      v1::DispatchEvent event;
+      *event.mutable_progress() = BaseEvent(*job->second);
+      event.mutable_progress()->set_kind(v1::ProgressEvent::PREFILL_DONE);
+      event.mutable_progress()->set_tokens_generated(1);
+      Publish(*job->second, std::move(event), false);
+    }
+    for (const auto& result : engine_.TakeResults()) {
+      auto node = running.extract(result.request_id);
+      if (!node.empty()) {
+        FinishJob(node.mapped(), result);
+      }
+    }
+
+    // Optional wall-clock pacing so simulated cost (and test-only fixed
+    // delays) turn into real time spent per iteration. Interruptible by stop.
+    std::chrono::microseconds pace = options_.step_delay;
+    if (options_.time_scale > 0.0) {
+      pace += std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::duration<double, std::nano>(
+              static_cast<double>(simulated.count()) * options_.time_scale));
+    }
+    std::unique_lock lock(mutex_);
+    stats_.peak_running = std::max(stats_.peak_running, engine_.active_count());
+    if (progressed && pace > std::chrono::microseconds::zero()) {
+      work_ready_.wait_for(lock, pace, [&] { return stop_; });
+    } else if (!progressed && !engine_.idle()) {
+      // Nothing admissible right now; wait briefly for new work or cancels.
+      work_ready_.wait_for(lock, kStallWait, [&] {
+        return stop_ || !incoming_.empty() || !cancels_.empty();
+      });
+    }
+  }
+
+  // Shutdown: fail every live attempt as retryable so a Router can redispatch.
+  for (auto& job : unstarted) {
+    running.insert_or_assign(job->dispatch.request().request_id(), job);
+  }
+  for (auto& [request_id, job] : running) {
+    FinishJob(job, engine::EngineResult{.request_id = request_id,
+                                        .succeeded = false,
+                                        .failure_reason = "engine_stopping"});
+  }
+}
+
+void EngineService::Publish(Job& job, v1::DispatchEvent event, const bool terminal) {
+  {
+    std::lock_guard lock(job.mutex);
+    job.events.push_back(std::move(event));
+    job.done = job.done || terminal;
+  }
+  job.changed.notify_all();
+}
+
+void EngineService::FinishJob(const std::shared_ptr<Job>& job,
+                              const engine::EngineResult& result) {
+  v1::DispatchEvent terminal;
+  auto* event = terminal.mutable_progress();
+  *event = BaseEvent(*job);
+  const bool superseded = job->superseded.load(std::memory_order_acquire);
+  const bool succeeded = result.succeeded && !superseded;
+  if (succeeded) {
+    event->set_kind(v1::ProgressEvent::COMPLETED);
+    event->set_tokens_generated(job->dispatch.request().sampling().max_output_tokens());
+    event->set_result_ref(result.output);
+    event->set_prefix_cache_hit(result.prefix_cache_hit);
+    event->set_result_cache_hit(result.result_cache_hit);
+  } else {
+    const std::string reason = superseded ? "superseded" : result.failure_reason;
+    event->set_kind(v1::ProgressEvent::FAILED);
+    event->set_failure_reason(reason);
+    event->set_retryable(RetryableFailure(reason));
+  }
+  Publish(*job, std::move(terminal), true);
+
+  std::lock_guard lock(mutex_);
+  const auto live = live_jobs_.find(job->dispatch.request().request_id());
+  if (live != live_jobs_.end() && live->second == job) {
+    live_jobs_.erase(live);
+  }
+  --outstanding_;
+  if (succeeded) {
+    ++stats_.completed;
+  } else if (result.failure_reason == "superseded" ||
+             result.failure_reason == "client_cancelled" || superseded) {
+    ++stats_.cancelled;
+  } else {
+    ++stats_.failed;
+  }
+  if (outstanding_ == 0) {
+    drained_.notify_all();
+  }
+}
+
+v1::ProgressEvent EngineService::BaseEvent(const Job& job) {
+  v1::ProgressEvent event;
+  event.set_request_id(job.dispatch.request().request_id());
+  event.set_trace_id(job.dispatch.request().trace_id());
+  event.set_span_id(job.dispatch.request().span_id());
+  *event.mutable_fence() = job.dispatch.fence();
+  return event;
+}
+
 engine::EngineRequest EngineService::ToEngineRequest(
-    const v1::InferenceRequest& request) {
-  return engine::EngineRequest{
+    const v1::InferenceRequest& request) const {
+  engine::EngineRequest converted{
       .request_id = request.request_id(),
       .model_revision = request.model_revision(),
       .tokenizer_revision = request.tokenizer_revision(),
@@ -216,37 +372,27 @@ engine::EngineRequest EngineService::ToEngineRequest(
           std::max(0.0, request.sampling().temperature()) * 1'000'000.0),
       .top_p_micros = static_cast<std::uint64_t>(
           std::max(0.0, request.sampling().top_p()) * 1'000'000.0)};
-}
 
-void EngineService::WriteProgress(
-    const Job& job, grpc::ServerWriter<v1::DispatchEvent>& writer) {
-  v1::DispatchEvent prefill;
-  auto* prefill_event = prefill.mutable_progress();
-  prefill_event->set_kind(v1::ProgressEvent::PREFILL_DONE);
-  prefill_event->set_request_id(job.dispatch.request().request_id());
-  prefill_event->set_trace_id(job.dispatch.request().trace_id());
-  prefill_event->set_span_id(job.dispatch.request().span_id());
-  *prefill_event->mutable_fence() = job.dispatch.fence();
-  static_cast<void>(writer.Write(prefill));
-
-  v1::DispatchEvent terminal;
-  auto* event = terminal.mutable_progress();
-  event->set_request_id(job.dispatch.request().request_id());
-  event->set_trace_id(job.dispatch.request().trace_id());
-  event->set_span_id(job.dispatch.request().span_id());
-  *event->mutable_fence() = job.dispatch.fence();
-  if (job.result.succeeded) {
-    event->set_kind(v1::ProgressEvent::COMPLETED);
-    event->set_tokens_generated(job.dispatch.request().sampling().max_output_tokens());
-    event->set_result_ref(job.result.output);
-    event->set_prefix_cache_hit(job.result.prefix_cache_hit);
-    event->set_result_cache_hit(job.result.result_cache_hit);
-  } else {
-    event->set_kind(v1::ProgressEvent::FAILED);
-    event->set_failure_reason(job.result.failure_reason);
-    event->set_retryable(job.result.failure_reason == "superseded");
+  // Simulated block hashes: full blocks inside the shared prefix hash by
+  // (prefix_id, block index) so requests sharing a prefix share KV blocks;
+  // the remaining blocks hash by the request's own prompt.
+  const std::size_t block = config_.kv_block_size_tokens;
+  const std::size_t blocks = (converted.prompt_tokens + block - 1) / block;
+  const std::size_t shared_tokens =
+      request.prefix_id().empty()
+          ? 0
+          : std::min<std::size_t>(request.prefix_tokens(), converted.prompt_tokens);
+  converted.prompt_block_hashes.reserve(blocks);
+  for (std::size_t index = 0; index < blocks; ++index) {
+    if ((index + 1) * block <= shared_tokens) {
+      converted.prompt_block_hashes.push_back("p:" + request.prefix_id() + ':' +
+                                              std::to_string(index));
+    } else {
+      converted.prompt_block_hashes.push_back("u:" + request.prompt_hash() + ':' +
+                                              std::to_string(index));
+    }
   }
-  static_cast<void>(writer.Write(terminal));
+  return converted;
 }
 
 }  // namespace infersched::distributed

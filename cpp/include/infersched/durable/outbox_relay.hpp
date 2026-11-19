@@ -3,7 +3,9 @@
 #include <chrono>
 #include <cstddef>
 #include <memory>
+#include <span>
 #include <string>
+#include <vector>
 
 #include "infersched/durable/durable_store.hpp"
 
@@ -13,6 +15,19 @@ class OutboxPublisher {
  public:
   virtual ~OutboxPublisher() = default;
   [[nodiscard]] virtual bool Publish(const OutboxRecord& record) = 0;
+  // Publishes a batch and reports per-record broker acknowledgement. The
+  // default publishes one record at a time and stops at the first failure.
+  [[nodiscard]] virtual std::vector<bool> PublishMany(
+      std::span<const OutboxRecord> records) {
+    std::vector<bool> delivered(records.size(), false);
+    for (std::size_t index = 0; index < records.size(); ++index) {
+      delivered[index] = Publish(records[index]);
+      if (!delivered[index]) {
+        break;
+      }
+    }
+    return delivered;
+  }
 };
 
 class KafkaOutboxPublisher final : public OutboxPublisher {
@@ -27,6 +42,9 @@ class KafkaOutboxPublisher final : public OutboxPublisher {
   KafkaOutboxPublisher& operator=(const KafkaOutboxPublisher&) = delete;
 
   [[nodiscard]] bool Publish(const OutboxRecord& record) override;
+  // Produces the whole batch, then waits once for all delivery reports.
+  [[nodiscard]] std::vector<bool> PublishMany(
+      std::span<const OutboxRecord> records) override;
 
  private:
   class Impl;

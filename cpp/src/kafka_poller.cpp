@@ -1,6 +1,7 @@
 #include "infersched/durable/kafka_poller.hpp"
 
 #include <algorithm>
+#include <map>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -147,6 +148,14 @@ void KafkaPoller::PollLoop() {
     return;
   }
 
+  // Only the highest safe offset per partition matters, so commits are
+  // coalesced and flushed at most every kCommitInterval, asynchronously while
+  // running (a lost commit only causes a redelivery that ingest deduplicates)
+  // and synchronously on shutdown. Per-offset synchronous commits stalled
+  // consumption and loaded the group coordinator under sustained traffic.
+  constexpr auto kCommitInterval = std::chrono::milliseconds(100);
+  std::map<std::int32_t, std::int64_t> latest;
+  auto last_commit = std::chrono::steady_clock::now();
   while (true) {
     std::deque<std::pair<std::int32_t, std::int64_t>> commits;
     bool should_stop = false;
@@ -156,10 +165,26 @@ void KafkaPoller::PollLoop() {
       commits.swap(commits_);
     }
     for (const auto& [partition, offset] : commits) {
-      std::vector<RdKafka::TopicPartition*> positions{
-          RdKafka::TopicPartition::create(topic_, partition, offset + 1)};
-      static_cast<void>(consumer->commitSync(positions));
+      const auto [entry, inserted] = latest.try_emplace(partition, offset);
+      if (!inserted) {
+        entry->second = std::max(entry->second, offset);
+      }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (!latest.empty() && (should_stop || now - last_commit >= kCommitInterval)) {
+      last_commit = now;
+      std::vector<RdKafka::TopicPartition*> positions;
+      positions.reserve(latest.size());
+      for (const auto& [partition, offset] : latest) {
+        positions.push_back(RdKafka::TopicPartition::create(topic_, partition, offset + 1));
+      }
+      if (should_stop) {
+        static_cast<void>(consumer->commitSync(positions));
+      } else {
+        static_cast<void>(consumer->commitAsync(positions));
+      }
       RdKafka::TopicPartition::destroy(positions);
+      latest.clear();
     }
     if (should_stop) {
       break;
@@ -178,7 +203,8 @@ void KafkaPoller::PollLoop() {
       messages_.push_back(KafkaMessage{
           .payload = std::string(payload, message->len()),
           .key = key == nullptr ? std::string{} : *key,
-          .partition = message->partition(), .offset = message->offset()});
+          .partition = message->partition(), .offset = message->offset(),
+          .timestamp_ms = message->timestamp().timestamp});
     }
     ready_.notify_one();
   }

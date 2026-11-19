@@ -18,6 +18,16 @@ target_link_libraries(infersched_concurrency_test
 
 gtest_discover_tests(infersched_concurrency_test PROPERTIES LABELS hermetic)
 
+add_executable(infersched_distributed_test distributed_test.cpp)
+target_link_libraries(infersched_distributed_test
+  PRIVATE infersched_core infersched_coordination GTest::gtest_main)
+gtest_discover_tests(infersched_distributed_test PROPERTIES LABELS hermetic)
+
+add_executable(infersched_coordination_test coordination_test.cpp)
+target_link_libraries(infersched_coordination_test
+  PRIVATE infersched_coordination GTest::gtest_main)
+gtest_discover_tests(infersched_coordination_test PROPERTIES LABELS live)
+
 add_executable(infersched_durable_test durable_test.cpp)
 target_link_libraries(infersched_durable_test
   PRIVATE infersched_durable GTest::gtest_main)
@@ -74,6 +84,24 @@ add_test(
 set_tests_properties(Distributed.MultiRouterKillAndRebalance
   PROPERTIES TIMEOUT 55 RUN_SERIAL TRUE LABELS live)
 
+add_test(
+  NAME Distributed.MultiEngineFailoverExactlyOnce
+  COMMAND ${CMAKE_SOURCE_DIR}/scripts/p8_multi_engine_failover.sh
+          $<TARGET_FILE:infersched_durable_router>
+          $<TARGET_FILE:infersched_engine>
+          $<TARGET_FILE:infersched_p5_client>)
+set_tests_properties(Distributed.MultiEngineFailoverExactlyOnce
+  PROPERTIES TIMEOUT 75 RUN_SERIAL TRUE LABELS live)
+
+add_test(
+  NAME Distributed.RedisPrefixAffinitySurvivesFlush
+  COMMAND ${CMAKE_SOURCE_DIR}/scripts/p8_prefix_affinity.sh
+          $<TARGET_FILE:infersched_durable_router>
+          $<TARGET_FILE:infersched_engine>
+          $<TARGET_FILE:infersched_p5_client>)
+set_tests_properties(Distributed.RedisPrefixAffinitySurvivesFlush
+  PROPERTIES TIMEOUT 75 RUN_SERIAL TRUE LABELS live)
+
 if(EXISTS "${CMAKE_SOURCE_DIR}/.venv/bin/python")
   add_test(
     NAME Python.GatewayUnit
@@ -91,5 +119,5 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/.venv/bin/python")
             ${CMAKE_SOURCE_DIR}/.venv/bin/python
             ${CMAKE_SOURCE_DIR})
   set_tests_properties(Distributed.FastApiGatewayEndToEnd
-    PROPERTIES TIMEOUT 45 RUN_SERIAL TRUE LABELS live)
+    PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE LABELS live)
 endif()

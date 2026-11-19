@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Unique per run even inside a fresh container, where $$ repeats.
+uid="$$-${RANDOM}${RANDOM}"
 
 router_binary="${1:?durable router binary required}"
 engine_binary="${2:?engine binary required}"
@@ -8,8 +10,8 @@ router_endpoint="127.0.0.1:55191"
 engine_endpoint="127.0.0.1:55192"
 router_log="${TMPDIR:-/tmp}/infersched-p5-router.log"
 engine_log="${TMPDIR:-/tmp}/infersched-p5-engine.log"
-group="infersched-p5-e2e-$$"
-ready="${TMPDIR:-/tmp}/infersched-p5-ready-$$"
+group="infersched-p5-e2e-${uid}"
+ready="${TMPDIR:-/tmp}/infersched-p5-ready-${uid}"
 rm -f "${ready}"
 
 "${router_binary}" --listen "${router_endpoint}" --requests 1 \

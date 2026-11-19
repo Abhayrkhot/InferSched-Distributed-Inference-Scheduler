@@ -36,11 +36,11 @@ ctest --test-dir build/default -R Distributed --output-on-failure
 P4 demonstrates real process/network separation, streamed RPC behavior, transport failure detection,
 and fence propagation. It does not yet claim an authoritative effectively-once result: accepted
 completion is still in memory. P5 adds PostgreSQL conditional finalization, the transactional outbox,
-Kafka offsets, and Redis-backed ephemeral lease hints.
+and Kafka offsets.
 
-P4 also does not yet implement load- or prefix-aware routing, heartbeat lease expiry, or bounded
-retention for in-memory fence/dedup records. The 1 ms worker coalescing window is a correctness-demo
-setting, not a latency-tuned production value.
+P4 also does not implement load- or prefix-aware routing or bounded retention for in-memory
+fence/dedup records. Those arrive in [P8](p8-multi-engine-routing.md), which also replaces the 1 ms
+per-RPC coalescing window with iteration-level admission across RPCs and adds Redis prefix hints.
 
 Current P4-safe resume wording: “Built process-separated C++ Engine execution over gRPC with
 epoch/attempt fencing and SIGKILL crash recovery.” Routing/load-balancing and authoritative

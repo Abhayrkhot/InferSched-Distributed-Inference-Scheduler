@@ -88,6 +88,14 @@ void DurableStore::Migrate() {
     );
     CREATE INDEX IF NOT EXISTS outbox_unpublished_idx
       ON outbox (id) WHERE published_at IS NULL;
+    -- IsSourcePublished runs once per completed Kafka offset; without this it
+    -- is a sequential scan whose cost grows with every result ever written.
+    CREATE INDEX IF NOT EXISTS outbox_source_idx
+      ON outbox (source_partition, source_offset);
+    -- RecoverUnresolved on every partition assignment: only scan live work.
+    CREATE INDEX IF NOT EXISTS inference_requests_unresolved_idx
+      ON inference_requests (source_partition, source_offset)
+      WHERE state NOT IN ('COMPLETED', 'FAILED_TERMINAL', 'CANCELLED', 'TIMED_OUT');
     DO $$ BEGIN
       IF (SELECT data_type = 'text' FROM information_schema.columns
            WHERE table_name = 'inference_requests' AND column_name = 'raw_payload') THEN
@@ -133,6 +141,35 @@ bool DurableStore::Ingest(const std::string_view request_id,
                        pqxx::binary_cast(raw_payload)});
   transaction.commit();
   return result.affected_rows() == 1;
+}
+
+std::vector<IngestStatus> DurableStore::IngestBatch(const std::span<const IngestRow> rows) {
+  std::vector<IngestStatus> statuses;
+  statuses.reserve(rows.size());
+  if (rows.empty()) {
+    return statuses;
+  }
+  pqxx::work transaction(impl_->connection);
+  for (const IngestRow& row : rows) {
+    const pqxx::result inserted = transaction.exec(R"sql(
+      INSERT INTO inference_requests
+        (request_id, source_partition, source_offset, raw_payload)
+      VALUES ($1, $2, $3, $4)
+      ON CONFLICT DO NOTHING
+    )sql", pqxx::params{row.request_id, row.source_partition, row.source_offset,
+                         pqxx::binary_cast(row.raw_payload)});
+    IngestStatus status{.inserted = inserted.affected_rows() == 1};
+    if (!status.inserted) {
+      const pqxx::result state = transaction.exec(R"sql(
+        SELECT state IN ('COMPLETED', 'FAILED_TERMINAL', 'CANCELLED', 'TIMED_OUT')
+          FROM inference_requests WHERE request_id = $1
+      )sql", pqxx::params{row.request_id});
+      status.terminal = !state.empty() && state[0][0].as<bool>();
+    }
+    statuses.push_back(status);
+  }
+  transaction.commit();
+  return statuses;
 }
 
 std::optional<Assignment> DurableStore::AssignAttempt(
@@ -215,6 +252,41 @@ bool DurableStore::Finalize(const std::string_view request_id, const Fence& fenc
   return true;
 }
 
+bool DurableStore::FailTerminal(const std::string_view request_id,
+                                const std::int32_t partition_id,
+                                const std::uint64_t ownership_epoch,
+                                const std::string_view result_payload) {
+  pqxx::work transaction(impl_->connection);
+  const pqxx::result updated = transaction.exec(R"sql(
+    UPDATE inference_requests AS request
+       SET state = 'FAILED_TERMINAL', state_version = request.state_version + 1,
+           terminal_result = $4, updated_at = now()
+      FROM partition_ownership AS owner
+     WHERE request.request_id = $1
+       AND request.source_partition = $2
+       AND owner.partition_id = $2
+       AND owner.ownership_epoch = $3
+       AND request.state NOT IN
+         ('COMPLETED', 'FAILED_TERMINAL', 'CANCELLED', 'TIMED_OUT')
+    RETURNING request.source_partition, request.source_offset
+  )sql", pqxx::params{request_id, partition_id, CheckedInt64(ownership_epoch),
+                       result_payload});
+  if (updated.empty()) {
+    transaction.commit();
+    return false;
+  }
+  transaction.exec(R"sql(
+    INSERT INTO outbox
+      (topic, message_key, payload, source_partition, source_offset)
+    VALUES ('inference.results', $1, $2, $3, $4)
+    ON CONFLICT (topic, message_key) DO NOTHING
+  )sql", pqxx::params{request_id, result_payload,
+                       updated[0][0].as<std::int32_t>(),
+                       updated[0][1].as<std::int64_t>()}).no_rows();
+  transaction.commit();
+  return true;
+}
+
 bool DurableStore::RecordPoison(const std::int32_t source_partition,
                                 const std::int64_t source_offset,
                                 const std::string_view raw_payload,
@@ -273,6 +345,25 @@ void DurableStore::MarkPublished(const std::int64_t outbox_id) {
   transaction.commit();
 }
 
+void DurableStore::MarkPublishedMany(const std::span<const std::int64_t> outbox_ids) {
+  if (outbox_ids.empty()) {
+    return;
+  }
+  std::string ids;
+  for (const std::int64_t id : outbox_ids) {
+    if (!ids.empty()) {
+      ids.push_back(',');
+    }
+    ids += std::to_string(id);
+  }
+  pqxx::work transaction(impl_->connection);
+  transaction.exec(R"sql(
+    UPDATE outbox SET published_at = COALESCE(published_at, now())
+     WHERE id = ANY(string_to_array($1, ',')::BIGINT[])
+  )sql", pqxx::params{ids}).no_rows();
+  transaction.commit();
+}
+
 std::vector<RecoveredRequest> DurableStore::RecoverUnresolved() const {
   pqxx::read_transaction transaction(impl_->connection);
   const pqxx::result rows = transaction.exec(R"sql(
@@ -313,6 +404,33 @@ bool DurableStore::IsSourcePublished(const std::int32_t source_partition,
      WHERE source_partition = $1 AND source_offset = $2
   )sql", pqxx::params{source_partition, source_offset});
   return !rows.empty() && !rows[0][0].is_null() && rows[0][0].as<bool>();
+}
+
+std::vector<bool> DurableStore::SourcesPublished(
+    const std::span<const std::pair<std::int32_t, std::int64_t>> sources) const {
+  std::vector<bool> published(sources.size(), false);
+  if (sources.empty()) {
+    return published;
+  }
+  // Integers only, so inlining them as a VALUES list is injection-safe.
+  std::string values;
+  for (std::size_t index = 0; index < sources.size(); ++index) {
+    values += index == 0 ? "(" : ",(";
+    values += std::to_string(index) + "::int," + std::to_string(sources[index].first) +
+              "::int," + std::to_string(sources[index].second) + "::bigint)";
+  }
+  pqxx::read_transaction transaction(impl_->connection);
+  const pqxx::result rows = transaction.exec(
+      "SELECT source.position, bool_and(outbox.published_at IS NOT NULL) "
+      "FROM (VALUES " + values + ") AS source(position, partition_id, offset_id) "
+      "LEFT JOIN outbox ON outbox.source_partition = source.partition_id "
+      "AND outbox.source_offset = source.offset_id "
+      "GROUP BY source.position");
+  for (const auto row : rows) {
+    const auto position = static_cast<std::size_t>(row[0].as<int>());
+    published[position] = !row[1].is_null() && row[1].as<bool>();
+  }
+  return published;
 }
 
 }  // namespace infersched::durable

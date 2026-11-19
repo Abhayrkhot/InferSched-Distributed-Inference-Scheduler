@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <optional>
 #include <queue>
+#include <string_view>
 #include <vector>
 
 #include "infersched/engine/deterministic_engine.hpp"
@@ -17,6 +18,9 @@ class RequestQueue {
   [[nodiscard]] std::optional<EngineRequest> PopReady(
       FakeClock::time_point now);
   [[nodiscard]] std::optional<FakeClock::time_point> NextArrival() const noexcept;
+  // Removes the queued request with this id. O(n log n); used only for
+  // cancellation, which is rare relative to admission.
+  [[nodiscard]] std::optional<EngineRequest> Remove(std::string_view request_id);
   [[nodiscard]] std::size_t size() const noexcept { return queue_.size(); }
   [[nodiscard]] bool empty() const noexcept { return queue_.empty(); }
 

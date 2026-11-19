@@ -40,9 +40,21 @@ class ContinuousEngine {
   [[nodiscard]] bool RunOneIteration();
   void RunUntilIdle();
   void ClearCaches() noexcept;
+  // Removes a queued or running request, frees its KV blocks, and records a
+  // failed result with `reason`. Returns false when the id is not live.
+  bool Cancel(std::string_view request_id, std::string_view reason);
 
   [[nodiscard]] const std::vector<EngineResult>& results() const noexcept {
     return results_;
+  }
+  // Moves out results recorded since the last call. A long-running Engine
+  // drains results through this so the history does not grow without bound.
+  [[nodiscard]] std::vector<EngineResult> TakeResults();
+  // Request ids that produced their first decoded token since the last call
+  // (the TTFT marker the network layer streams as PREFILL_DONE).
+  [[nodiscard]] std::vector<std::string> TakeFirstTokens();
+  [[nodiscard]] bool idle() const noexcept {
+    return pending_.empty() && active_.empty();
   }
   [[nodiscard]] const ContinuousEngineStats& stats() const noexcept {
     return stats_;
@@ -77,6 +89,7 @@ class ContinuousEngine {
   [[nodiscard]] std::string ResultKey(const EngineRequest& request) const;
   [[nodiscard]] std::string PrefixNamespace(const EngineRequest& request) const;
   [[nodiscard]] std::string SimulatedOutput(const EngineRequest& request) const;
+  void ForgetRequest(const std::string& request_id);
 
   EngineConfig config_;
   FakeClock clock_;
@@ -87,6 +100,7 @@ class ContinuousEngine {
   RequestQueue pending_;
   std::vector<ActiveRequest> active_;
   std::vector<EngineResult> results_;
+  std::vector<std::string> first_tokens_;
   ContinuousEngineStats stats_;
   std::unordered_set<std::string> preempted_requests_;
   std::unordered_set<std::string> prefix_accounted_requests_;

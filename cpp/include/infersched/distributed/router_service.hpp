@@ -7,6 +7,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <vector>
 
 #include <grpcpp/grpcpp.h>
 
@@ -38,6 +39,11 @@ class RouterService final : public v1::RouterControl::Service {
       std::chrono::milliseconds timeout);
   [[nodiscard]] std::optional<EngineRecord> WaitForNewIncarnation(
       std::string_view previous_incarnation,
+      std::chrono::milliseconds timeout);
+  // Snapshot of every Engine whose lease is currently live.
+  [[nodiscard]] std::vector<EngineRecord> LiveEngines();
+  // Blocks until at least one live Engine exists or the timeout passes.
+  [[nodiscard]] std::vector<EngineRecord> WaitForLiveEngines(
       std::chrono::milliseconds timeout);
 
  private:

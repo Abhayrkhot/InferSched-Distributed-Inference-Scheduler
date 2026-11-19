@@ -23,6 +23,7 @@ struct KafkaMessage {
   std::string key;
   std::int32_t partition{};
   std::int64_t offset{};
+  std::int64_t timestamp_ms{-1};  // Producer CreateTime, -1 when unavailable.
 };
 
 enum class OwnershipEventKind { kAssigned, kRevoked };

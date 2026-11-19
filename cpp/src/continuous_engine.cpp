@@ -64,11 +64,53 @@ bool ContinuousEngine::RunOneIteration() {
     ++active.generated_tokens;
     if (active.generated_tokens == 1) {
       active.first_token_at = clock_.Now();
+      first_tokens_.push_back(active.request.request_id);
     }
   }
   ++stats_.iterations;
   CompleteFinished();
   return true;
+}
+
+bool ContinuousEngine::Cancel(const std::string_view request_id,
+                              const std::string_view reason) {
+  std::optional<std::string> cancelled;
+  const auto active = std::ranges::find_if(active_, [&](const ActiveRequest& entry) {
+    return entry.request.request_id == request_id;
+  });
+  if (active != active_.end()) {
+    static_cast<void>(kv_cache_.Free(active->request.request_id));
+    cancelled = active->request.request_id;
+    active_.erase(active);
+  } else if (auto queued = pending_.Remove(request_id); queued.has_value()) {
+    cancelled = std::move(queued->request_id);
+  }
+  if (!cancelled.has_value()) {
+    return false;
+  }
+  results_.push_back(EngineResult{.request_id = *cancelled,
+                                  .completed_at = clock_.Now(),
+                                  .succeeded = false,
+                                  .failure_reason = std::string(reason)});
+  ForgetRequest(*cancelled);
+  return true;
+}
+
+std::vector<EngineResult> ContinuousEngine::TakeResults() {
+  std::vector<EngineResult> taken;
+  taken.swap(results_);
+  return taken;
+}
+
+std::vector<std::string> ContinuousEngine::TakeFirstTokens() {
+  std::vector<std::string> taken;
+  taken.swap(first_tokens_);
+  return taken;
+}
+
+void ContinuousEngine::ForgetRequest(const std::string& request_id) {
+  preempted_requests_.erase(request_id);
+  prefix_accounted_requests_.erase(request_id);
 }
 
 void ContinuousEngine::RunUntilIdle() {
@@ -107,6 +149,7 @@ bool ContinuousEngine::AdmitReady() {
                                       .completed_at = clock_.Now(),
                                       .succeeded = false,
                                       .failure_reason = std::string(*reason)});
+      ForgetRequest(candidate.request_id);
       admitted_any = true;
       continue;
     }
@@ -135,6 +178,7 @@ bool ContinuousEngine::AdmitReady() {
                                       .completed_at = clock_.Now(),
                                       .first_token_at = clock_.Now(),
                                       .result_cache_hit = true});
+      ForgetRequest(candidate.request_id);
       admitted_any = true;
       continue;
     }
@@ -271,6 +315,7 @@ void ContinuousEngine::CompleteFinished() {
                                             ? clock_.Now()
                                             : active.first_token_at,
                                     .prefix_cache_hit = active.prefix_cache_hit});
+    ForgetRequest(active.request.request_id);
     active_.erase(active_.begin() + static_cast<std::ptrdiff_t>(index));
   }
 }

@@ -626,7 +626,7 @@
               <div class="side-note">Separate, non-authoritative hint store</div>
               <article class="data-node">
                 <h3>Redis</h3>
-                <p>Disposable lease hints. Flushing Redis cannot change authoritative request state.</p>
+                <p>Disposable prefix-affinity hints (Engine incarnation per prompt prefix). Flushing Redis cannot change authoritative request state.</p>
               </article>
             </div>
 
@@ -649,11 +649,11 @@
         </article>
         <article class="card router">
           <h3>Router Fleet</h3>
-          <p>Owns coordination, durable attempts, Engine dispatch, retry, rebalance, and recovery.</p>
+          <p>Owns coordination, durable attempts, load- and prefix-aware dispatch across Engines, retry, cancellation, rebalance, and recovery.</p>
         </article>
         <article class="card engine">
           <h3>Engine Fleet</h3>
-          <p>Owns continuous batching, active sequences, paged KV memory, caches, and preemption.</p>
+          <p>Owns continuous batching across RPCs, active sequences, paged KV memory, caches, preemption, and fenced cancellation.</p>
         </article>
         <article class="card database">
           <h3>PostgreSQL</h3>
@@ -661,7 +661,7 @@
         </article>
         <article class="card">
           <h3>Redis</h3>
-          <p>Holds disposable coordination hints. Losing Redis cannot corrupt authoritative request state.</p>
+          <p>Holds disposable prefix-affinity hints that steer requests to an Engine likely to hold their KV prefix. Losing Redis costs cache locality, never correctness.</p>
         </article>
       </div>
     </section>
@@ -672,7 +672,7 @@
         <li><strong>Accept:</strong> FastAPI validates the request, assigns request and trace IDs, and publishes protobuf to Kafka.</li>
         <li><strong>Assign:</strong> Kafka gives the request partition to exactly one active Router in the consumer group.</li>
         <li><strong>Fence:</strong> The Router records the request in PostgreSQL and obtains a partition epoch and attempt ID.</li>
-        <li><strong>Execute:</strong> The Router dispatches over gRPC. The Engine continuously batches the request and manages its KV pages.</li>
+        <li><strong>Execute:</strong> The Router picks the least-loaded Engine, or the one a Redis hint says holds the prompt prefix, and dispatches over gRPC with many attempts in flight. The Engine admits the request into its running batch and manages its KV pages; failed attempts are retried on another Engine.</li>
         <li><strong>Finalize:</strong> PostgreSQL accepts the completion only when the partition, epoch, Engine, attempt, and state are current.</li>
         <li><strong>Publish:</strong> The result and outbox row commit together. The relay publishes to Kafka after the database transaction.</li>
         <li><strong>Return:</strong> The gateway correlates the Kafka result with the waiting HTTP request and returns it to the client.</li>
@@ -859,7 +859,7 @@
           <div class="work-body">
             <div>
               <h4>Understand</h4>
-              <p>The gateway bounds pending work, publishes protobuf, consumes results, correlates traces, and reports metrics. Open-loop load arrives independently of completions.</p>
+              <p>The gateway bounds pending work, acknowledges only broker-persisted requests, long-polls results, expires lost ones, exports Prometheus metrics, and emits trace spans. Open-loop load arrives independently of completions and is spread across client processes so the client never measures itself.</p>
             </div>
             <div>
               <h4>Read</h4>
@@ -868,6 +868,29 @@
             <div>
               <h4>Evidence</h4>
               <p>Tests cover HTTP 429 and the live FastAPI path. Reproducible baselines report bucketed latency, utilization, cache hit rates, completion, and zero KV leaks.</p>
+            </div>
+          </div>
+        </details>
+
+        <details class="work-item">
+          <summary>
+            <span class="phase-number">8</span>
+            <span class="phase-title">Engine fleet routing and coordination hints</span>
+            <span class="phase-goal">Run many fenced attempts per Router across an Engine fleet, with failover, cancellation, and Redis prefix affinity.</span>
+            <span class="status">Implemented</span>
+          </summary>
+          <div class="work-body">
+            <div>
+              <h4>Understand</h4>
+              <p>Dispatch workers share a small Postgres pool and lease it only for fenced writes. Each attempt goes to the least-loaded Engine unless an incarnation-checked Redis hint points at a warm prefix cache. Failures retry elsewhere; unrecoverable requests become owner-fenced terminal failures.</p>
+            </div>
+            <div>
+              <h4>Read</h4>
+              <p><code>durable_router_main.cpp</code>, <code>engine_selector.cpp</code>, <code>redis_hints.cpp</code>, <code>engine_service.cpp</code>, and <code>docs/p8-multi-engine-routing.md</code>.</p>
+            </div>
+            <div>
+              <h4>Evidence</h4>
+              <p>A slow Engine is SIGKILLed mid-flight and all 60 requests still complete exactly once; prefix hints are followed and then flushed without losing a request; an in-process gRPC test shows a late short request finishing inside a long running batch.</p>
             </div>
           </div>
         </details>
@@ -912,16 +935,22 @@
               <td>E2E p99 reduced from 8.2 ms to 2.0 ms</td>
             </tr>
             <tr>
-              <td>Live distributed integration path</td>
-              <td>100 requests at 50 offered QPS</td>
-              <td>46.5 achieved QPS and 125.6 ms p99</td>
+              <td>Router coordination path (Linux host)</td>
+              <td>Request burst, zero simulated compute</td>
+              <td>68 req/s serial Router → ~1,450 req/s concurrent Router</td>
+            </tr>
+            <tr>
+              <td>Full HTTP distributed path (Linux host)</td>
+              <td>6,000 open-loop requests at 600 offered QPS, 2 Engines</td>
+              <td>558 achieved QPS, 58 ms p50, 98 ms p99, 0 errors</td>
             </tr>
           </tbody>
         </table>
       </div>
       <p class="notice">
-        Percentiles use power-of-two histogram bucket upper bounds. The live distributed measurement
-        is an integration baseline, not a horizontal scaling curve. See <a href="https://github.com/Abhayrkhot/InferSched-Distributed-Inference-Scheduler/blob/main/docs/benchmarks.md">the
+        In-process percentiles use power-of-two histogram bucket upper bounds; distributed percentiles
+        are exact and client-observed on a shared Linux host. The distributed measurements are
+        single-Router, single-gateway results, not a horizontal scaling curve. See <a href="https://github.com/Abhayrkhot/InferSched-Distributed-Inference-Scheduler/blob/main/docs/benchmarks.md">the
         benchmark report</a> for methodology and claim boundaries.
       </p>
     </section>
