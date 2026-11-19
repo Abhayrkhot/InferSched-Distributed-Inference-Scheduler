@@ -12,7 +12,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        preset: [default, asan, tsan]
+        # ASan runs on Linux (hermetic-asan below). On macOS, generated
+        # messages built with ASan crash in protobuf's sanitizer-only
+        # TcParser::VerifyHasBitConsistency check against Homebrew's
+        # uninstrumented libprotobuf 36.x; TSan runs the same check fine.
+        preset: [default, tsan]
     steps:
       - uses: actions/checkout@v5
 
@@ -42,6 +46,45 @@ jobs:
           ASAN_OPTIONS: abort_on_error=1
           TSAN_OPTIONS: halt_on_error=1
         run: ctest --test-dir build/${{ matrix.preset }} -LE live --output-on-failure
+
+  hermetic-asan:
+    name: hermetic-asan
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build pkg-config \
+            protobuf-compiler protobuf-compiler-grpc libprotobuf-dev \
+            libgrpc++-dev libabsl-dev libpq-dev librdkafka-dev libhiredis-dev
+
+      - name: Install libpqxx 8
+        run: |
+          git clone --depth 1 --branch 8.0.1 https://github.com/jtv/libpqxx.git /tmp/libpqxx
+          cmake -S /tmp/libpqxx -B /tmp/libpqxx-build -G Ninja -DSKIP_BUILD_TEST=ON
+          cmake --build /tmp/libpqxx-build --parallel
+          sudo cmake --install /tmp/libpqxx-build
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install -r python/requirements.txt
+
+      - name: Configure and build
+        run: |
+          cmake --preset asan -G Ninja
+          cmake --build build/asan --parallel
+
+      - name: Test without external services (ASan + LeakSanitizer)
+        env:
+          ASAN_OPTIONS: abort_on_error=1:detect_leaks=1
+        run: ctest --test-dir build/asan -LE live --output-on-failure
 
   live-infrastructure:
     name: live-kafka-postgres-redis
