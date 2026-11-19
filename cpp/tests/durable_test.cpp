@@ -97,6 +97,39 @@ TEST_F(PostgresDurability, CurrentFenceAloneCanFinalizeAndCreatesOneOutbox) {
             }), 1);
 }
 
+TEST_F(PostgresDurability, OwnerFencedTerminalFailureBlocksLateCompletion) {
+  const std::string request_id = Unique("terminal");
+  const std::int32_t partition = 707;
+  const std::int64_t offset = UniqueOffset();
+  const std::uint64_t old_epoch = store->AcquirePartition(partition, "router-old");
+  ASSERT_TRUE(store->Ingest(request_id, partition, offset, "request"));
+  const auto attempt = store->AssignAttempt(request_id, partition, old_epoch, "engine-a");
+  ASSERT_TRUE(attempt.has_value());
+  const std::uint64_t new_epoch = store->AcquirePartition(partition, "router-new");
+
+  // A deposed owner cannot fail the request terminally.
+  EXPECT_FALSE(store->FailTerminal(request_id, partition, old_epoch, "{\"status\":\"FAILED\"}"));
+  EXPECT_TRUE(store->FailTerminal(request_id, partition, new_epoch, "{\"status\":\"FAILED\"}"));
+  EXPECT_TRUE(store->IsTerminal(request_id));
+  EXPECT_FALSE(store->FailTerminal(request_id, partition, new_epoch, "again"));
+  // The older attempt finishing late is rejected; exactly one result row exists.
+  EXPECT_FALSE(store->Finalize(request_id, attempt->fence, "late-success"));
+  const auto rows = store->FetchUnpublished(100000);
+  EXPECT_EQ(std::count_if(rows.begin(), rows.end(), [&](const OutboxRecord& row) {
+              return row.topic == "inference.results" && row.message_key == request_id &&
+                     row.payload == "{\"status\":\"FAILED\"}";
+            }), 1);
+
+  std::vector<std::int64_t> ids;
+  for (const auto& row : rows) {
+    if (row.message_key == request_id) {
+      ids.push_back(row.id);
+    }
+  }
+  store->MarkPublishedMany(ids);
+  EXPECT_TRUE(store->IsSourcePublished(partition, offset));
+}
+
 TEST_F(PostgresDurability, OptimisticStateVersionRejectsStaleTransitions) {
   const std::string request_id = Unique("versioned");
   ASSERT_TRUE(store->Ingest(request_id, 704, UniqueOffset(), "request"));

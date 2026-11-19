@@ -24,6 +24,26 @@ std::optional<FakeClock::time_point> RequestQueue::NextArrival() const noexcept 
                               queue_.top().arrival_time};
 }
 
+std::optional<EngineRequest> RequestQueue::Remove(
+    const std::string_view request_id) {
+  std::vector<EngineRequest> kept;
+  kept.reserve(queue_.size());
+  std::optional<EngineRequest> removed;
+  while (!queue_.empty()) {
+    EngineRequest request = queue_.top();
+    queue_.pop();
+    if (!removed.has_value() && request.request_id == request_id) {
+      removed = std::move(request);
+    } else {
+      kept.push_back(std::move(request));
+    }
+  }
+  for (auto& request : kept) {
+    queue_.push(std::move(request));
+  }
+  return removed;
+}
+
 bool RequestQueue::Later::operator()(const EngineRequest& lhs,
                                      const EngineRequest& rhs) const noexcept {
   if (lhs.arrival_time != rhs.arrival_time) {

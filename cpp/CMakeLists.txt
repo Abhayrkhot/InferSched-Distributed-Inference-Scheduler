@@ -7,6 +7,7 @@ add_library(infersched_core
   src/cost_model.cpp
   src/continuous_engine.cpp
   src/deterministic_engine.cpp
+  src/engine_selector.cpp
   src/execution_state.cpp
   src/engine_service.cpp
   src/histogram.cpp
@@ -32,10 +33,20 @@ add_library(infersched_durable
   src/kafka_poller.cpp
   src/offset_tracker.cpp
   src/outbox_relay.cpp
-  src/request_ingestor.cpp)
+  src/request_ingestor.cpp
+  src/trace_emitter.cpp)
 target_include_directories(infersched_durable PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(infersched_durable
   PUBLIC infersched_proto libpqxx::pqxx PkgConfig::RDKAFKA
+  PRIVATE infersched_warnings)
+
+# Redis-backed coordination hints (prefix affinity). Outside the correctness
+# boundary: every call degrades to "no hint" when Redis is unavailable.
+pkg_check_modules(HIREDIS REQUIRED IMPORTED_TARGET hiredis)
+add_library(infersched_coordination src/redis_hints.cpp)
+target_include_directories(infersched_coordination PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(infersched_coordination
+  PUBLIC PkgConfig::HIREDIS
   PRIVATE infersched_warnings)
 
 add_subdirectory(tests)
@@ -49,7 +60,7 @@ target_link_libraries(infersched_router PRIVATE infersched_core)
 
 add_executable(infersched_durable_router src/durable_router_main.cpp)
 target_link_libraries(infersched_durable_router
-  PRIVATE infersched_core infersched_durable)
+  PRIVATE infersched_core infersched_durable infersched_coordination)
 
 add_executable(infersched_p5_client src/p5_client_main.cpp)
 target_link_libraries(infersched_p5_client PRIVATE infersched_durable)

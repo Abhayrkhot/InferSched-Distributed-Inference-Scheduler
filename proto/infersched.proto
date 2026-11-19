@@ -87,6 +87,12 @@ message InferenceRequest {
   SamplingParams sampling = 9;
   string trace_id        = 10;
   string span_id         = 11;
+  // Simulated shared prompt prefix (system prompt, few-shot block, ...). The
+  // first `prefix_tokens` tokens of every request with the same prefix_id are
+  // identical, so their full KV blocks can be reused across requests. The
+  // Router also uses prefix_id as its Redis prefix-affinity key.
+  string prefix_id       = 12;
+  uint32 prefix_tokens   = 13;
 }
 
 message DispatchRequest {
