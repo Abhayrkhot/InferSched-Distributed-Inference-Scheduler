@@ -2,7 +2,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <string>
 #include <utility>
+
+#include "infersched/util/json.hpp"
 
 namespace infersched::distributed {
 namespace {
@@ -93,7 +96,9 @@ grpc::Status EngineService::Cancel(grpc::ServerContext* context,
     if (fence.ownership_epoch() == request->fence().ownership_epoch() &&
         fence.attempt_id() == request->fence().attempt_id()) {
       iterator->second->superseded.store(true, std::memory_order_release);
-      cancels_.emplace_back(request->request_id(), "superseded");
+      if (options_.cancellation) {
+        cancels_.emplace_back(request->request_id(), "superseded");
+      }
       reply->set_accepted(true);
       work_ready_.notify_one();
     }
@@ -140,6 +145,63 @@ EngineService::Stats EngineService::stats() const {
   return stats_;
 }
 
+std::string EngineService::UtilizationJson(const std::string& engine_id) const {
+  std::lock_guard lock(mutex_);
+  const auto& engine = engine_stats_;
+  const auto ms = [](const std::chrono::nanoseconds value) {
+    return std::to_string(std::chrono::duration<double, std::milli>(value).count());
+  };
+  double window_ms = 0.0;
+  if (first_accept_.has_value() && last_finish_.has_value()) {
+    window_ms = std::chrono::duration<double, std::milli>(*last_finish_ - *first_accept_)
+                    .count();
+  }
+  // Wall-clock busy time is modeled time paced by time_scale (plus any fixed
+  // per-iteration delay, which is not modeled compute and is excluded).
+  const double busy_wall_ms =
+      std::chrono::duration<double, std::milli>(engine.simulated_busy_time).count() *
+      options_.time_scale;
+  // Output that reached a live client. With cancellation off, abandoned
+  // attempts still complete inside the engine; they are not useful work.
+  const std::uint64_t useful =
+      engine.useful_output_tokens > stats_.abandoned_output_tokens
+          ? engine.useful_output_tokens - stats_.abandoned_output_tokens
+          : 0;
+  const double busy_s = std::chrono::duration<double>(engine.simulated_busy_time).count();
+  util::JsonObject json;
+  json.Add("engine_id", engine_id)
+      .Add("policy", config_.admission == engine::AdmissionPolicy::kStatic ? "static"
+                                                                           : "continuous")
+      .Add("cancellation", options_.cancellation)
+      .Add("completed", stats_.completed)
+      .Add("failed", stats_.failed)
+      .Add("cancelled", stats_.cancelled)
+      .Add("decode_iterations", engine.iterations)
+      .Add("decode_token_slots", engine.decode_token_slots)
+      .Add("completed_output_tokens", engine.useful_output_tokens)
+      .Add("useful_output_tokens", useful)
+      .Add("wasted_decode_tokens", engine.wasted_decode_tokens)
+      .Add("abandoned_output_tokens", stats_.abandoned_output_tokens)
+      .Add("prefill_tokens_computed", engine.prefill_tokens_computed)
+      .Add("prefill_tokens_reused", engine.prefill_tokens_reused)
+      .Add("wasted_prefill_tokens", engine.wasted_prefill_tokens)
+      .Add("preemptions", engine.preemptions)
+      .AddRaw("mean_batch_occupancy", std::to_string(engine.mean_batch_occupancy()))
+      .Add("peak_running", stats_.peak_running)
+      .AddRaw("modeled_busy_ms", ms(engine.simulated_busy_time))
+      .AddRaw("modeled_prefill_ms", ms(engine.simulated_prefill_time))
+      .AddRaw("modeled_decode_ms", ms(engine.simulated_decode_time))
+      .AddRaw("useful_tokens_per_busy_s",
+              std::to_string(busy_s > 0.0 ? static_cast<double>(useful) / busy_s : 0.0))
+      .AddRaw("time_scale", std::to_string(options_.time_scale))
+      .AddRaw("window_ms", std::to_string(window_ms))
+      .AddRaw("busy_fraction",
+              std::to_string(window_ms > 0.0 && options_.time_scale > 0.0
+                                 ? busy_wall_ms / window_ms
+                                 : 0.0));
+  return json.str();
+}
+
 std::string EngineService::ValidateAndReserve(
     const v1::DispatchRequest& request, const std::shared_ptr<Job>& job) {
   std::lock_guard lock(mutex_);
@@ -177,6 +239,9 @@ std::string EngineService::ValidateAndReserve(
   RememberAttempt(request_id, attempt);
   live_jobs_.emplace(request_id, job);
   incoming_.push_back(job);
+  if (!first_accept_.has_value()) {
+    first_accept_ = std::chrono::steady_clock::now();
+  }
   ++outstanding_;
   ++stats_.accepted;
   work_ready_.notify_one();
@@ -203,6 +268,13 @@ void EngineService::RequestCancel(const std::string& request_id,
                                   std::string reason) {
   {
     std::lock_guard lock(mutex_);
+    const auto live = live_jobs_.find(request_id);
+    if (live != live_jobs_.end()) {
+      live->second->abandoned.store(true, std::memory_order_release);
+    }
+    if (!options_.cancellation) {
+      return;  // Measurement mode: keep computing the abandoned sequence.
+    }
     cancels_.emplace_back(request_id, std::move(reason));
   }
   work_ready_.notify_one();
@@ -278,6 +350,7 @@ void EngineService::WorkerLoop() {
     }
     std::unique_lock lock(mutex_);
     stats_.peak_running = std::max(stats_.peak_running, engine_.active_count());
+    engine_stats_ = engine_.stats();
     if (progressed && pace > std::chrono::microseconds::zero()) {
       work_ready_.wait_for(lock, pace, [&] { return stop_; });
     } else if (!progressed && !engine_.idle()) {
@@ -314,6 +387,7 @@ void EngineService::FinishJob(const std::shared_ptr<Job>& job,
   auto* event = terminal.mutable_progress();
   *event = BaseEvent(*job);
   const bool superseded = job->superseded.load(std::memory_order_acquire);
+  const bool abandoned = job->abandoned.load(std::memory_order_acquire);
   const bool succeeded = result.succeeded && !superseded;
   if (succeeded) {
     event->set_kind(v1::ProgressEvent::COMPLETED);
@@ -335,6 +409,11 @@ void EngineService::FinishJob(const std::shared_ptr<Job>& job,
     live_jobs_.erase(live);
   }
   --outstanding_;
+  last_finish_ = std::chrono::steady_clock::now();
+  if (result.succeeded && (superseded || abandoned)) {
+    stats_.abandoned_output_tokens +=
+        job->dispatch.request().sampling().max_output_tokens();
+  }
   if (succeeded) {
     ++stats_.completed;
   } else if (result.failure_reason == "superseded" ||

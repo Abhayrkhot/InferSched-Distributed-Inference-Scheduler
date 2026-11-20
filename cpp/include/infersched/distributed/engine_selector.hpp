@@ -13,6 +13,14 @@
 
 namespace infersched::distributed {
 
+enum class RoutingPolicy {
+  kLeastLoaded,  // Load estimate + optional prefix affinity (default).
+  kRoundRobin,   // Rotate through live Engines, ignoring load.
+  kFirst,        // Always the lowest engine_id: the pre-P8 single-Engine behaviour.
+};
+
+[[nodiscard]] std::optional<RoutingPolicy> ParseRoutingPolicy(std::string_view name);
+
 struct SelectionInput {
   const std::vector<EngineRecord>& engines;
   // Attempts this Router has in flight per engine_id (exact for this Router).
@@ -27,6 +35,9 @@ struct SelectionInput {
   // the request id — so ties spread across Engines instead of always landing
   // on the lexicographically first one.
   std::string_view tie_breaker{};
+  RoutingPolicy policy{RoutingPolicy::kLeastLoaded};
+  // Monotonic per-Router counter used by kRoundRobin.
+  std::size_t round_robin_ticket{};
 };
 
 struct Selection {
@@ -40,9 +51,10 @@ struct Selection {
 [[nodiscard]] std::size_t EstimateLoad(const EngineRecord& engine,
                                        std::size_t local_inflight);
 
-// Deterministic choice: valid affinity hint within slack, otherwise the least
-// loaded non-saturated Engine (ties broken by engine_id). nullopt when every
-// live Engine is excluded or there are none.
+// kLeastLoaded: valid affinity hint within slack, otherwise the least loaded
+// non-saturated Engine (ties by hash). kRoundRobin / kFirst ignore load and
+// hints but still skip excluded Engines. nullopt when every live Engine is
+// excluded or there are none.
 [[nodiscard]] std::optional<Selection> SelectEngine(const SelectionInput& input);
 
 }  // namespace infersched::distributed

@@ -16,7 +16,14 @@
 
 namespace infersched::engine {
 
+// How ContinuousEngine admits waiting requests.
+//   kContinuous: at every iteration boundary, into any free batch slot.
+//   kStatic:     only once the running batch has fully drained (request-level
+//                batching). Same data structures, so it isolates the policy.
+enum class AdmissionPolicy { kContinuous, kStatic };
+
 struct EngineConfig {
+  AdmissionPolicy admission{AdmissionPolicy::kContinuous};
   std::size_t kv_blocks{256};
   std::size_t kv_block_size_tokens{16};
   std::size_t max_batch_sequences{8};

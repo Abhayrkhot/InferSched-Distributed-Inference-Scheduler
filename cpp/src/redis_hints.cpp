@@ -29,8 +29,8 @@ RedisHints::~RedisHints() {
 }
 
 std::optional<RedisHintsOptions> RedisHints::ParseAddress(const std::string_view address) {
-  if (address.empty()) {
-    return std::nullopt;
+  if (address.empty() || address == "none" || address == "off") {
+    return std::nullopt;  // Hints disabled.
   }
   RedisHintsOptions options;
   const auto colon = address.rfind(':');

@@ -60,6 +60,8 @@ bool ContinuousEngine::RunOneIteration() {
   const auto decode_cost = cost_model_.DecodeStep(active_.size());
   clock_.Advance(decode_cost);
   stats_.simulated_busy_time += decode_cost;
+  stats_.simulated_decode_time += decode_cost;
+  stats_.decode_token_slots += active_.size();
   for (auto& active : active_) {
     ++active.generated_tokens;
     if (active.generated_tokens == 1) {
@@ -80,6 +82,8 @@ bool ContinuousEngine::Cancel(const std::string_view request_id,
   });
   if (active != active_.end()) {
     static_cast<void>(kv_cache_.Free(active->request.request_id));
+    stats_.wasted_decode_tokens += active->generated_tokens;
+    stats_.wasted_prefill_tokens += active->prefilled_tokens;
     cancelled = active->request.request_id;
     active_.erase(active);
   } else if (auto queued = pending_.Remove(request_id); queued.has_value()) {
@@ -88,6 +92,7 @@ bool ContinuousEngine::Cancel(const std::string_view request_id,
   if (!cancelled.has_value()) {
     return false;
   }
+  ++stats_.cancellations;
   results_.push_back(EngineResult{.request_id = *cancelled,
                                   .completed_at = clock_.Now(),
                                   .succeeded = false,
@@ -130,6 +135,9 @@ void ContinuousEngine::RunUntilIdle() {
 void ContinuousEngine::ClearCaches() noexcept { prefix_cache_.Clear(); }
 
 bool ContinuousEngine::AdmitReady() {
+  if (config_.admission == AdmissionPolicy::kStatic && !active_.empty()) {
+    return false;  // Request-level batching: wait for the batch to drain.
+  }
   bool admitted_any = false;
   std::size_t prefill_budget = 0;
   std::size_t prefill_sequences = 0;
@@ -234,10 +242,14 @@ bool ContinuousEngine::AdmitReady() {
         matched_blocks >= prompt_blocks
             ? active.request.prompt_tokens
             : matched_blocks * config_.kv_block_size_tokens;
-    const auto prefill_cost =
-        cost_model_.Prefill(active.request.prompt_tokens - cached_tokens);
+    const std::size_t uncached_tokens = active.request.prompt_tokens - cached_tokens;
+    const auto prefill_cost = cost_model_.Prefill(uncached_tokens);
     clock_.Advance(prefill_cost);
     stats_.simulated_busy_time += prefill_cost;
+    stats_.simulated_prefill_time += prefill_cost;
+    stats_.prefill_tokens_computed += uncached_tokens;
+    stats_.prefill_tokens_reused += cached_tokens;
+    active.prefilled_tokens = uncached_tokens;
     static_cast<void>(active.state.TransitionTo(ExecutionState::kDecode));
 
     if (!active.request.prompt_block_hashes.empty()) {
@@ -315,6 +327,8 @@ void ContinuousEngine::CompleteFinished() {
                                             ? clock_.Now()
                                             : active.first_token_at,
                                     .prefix_cache_hit = active.prefix_cache_hit});
+    stats_.useful_output_tokens += active.generated_tokens;
+    ++stats_.completed_requests;
     ForgetRequest(active.request.request_id);
     active_.erase(active_.begin() + static_cast<std::ptrdiff_t>(index));
   }
@@ -322,6 +336,10 @@ void ContinuousEngine::CompleteFinished() {
 
 void ContinuousEngine::Preempt(const std::size_t active_index) {
   ActiveRequest victim = std::move(active_[active_index]);
+  // Recompute-style preemption: the victim restarts from prefill, so the
+  // tokens and prefill it already spent are thrown away.
+  stats_.wasted_decode_tokens += victim.generated_tokens;
+  stats_.wasted_prefill_tokens += victim.prefilled_tokens;
   static_cast<void>(victim.state.TransitionTo(ExecutionState::kPreempted));
   static_cast<void>(victim.state.TransitionTo(ExecutionState::kWaitingAdmission));
   static_cast<void>(kv_cache_.Free(victim.request.request_id));

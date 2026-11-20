@@ -40,7 +40,7 @@ class RedisHints {
   RedisHints(const RedisHints&) = delete;
   RedisHints& operator=(const RedisHints&) = delete;
 
-  // Parses "host:port". An empty string yields nullopt (hints disabled).
+  // Parses "host:port". "", "none", or "off" yield nullopt (hints disabled).
   [[nodiscard]] static std::optional<RedisHintsOptions> ParseAddress(
       std::string_view address);
 

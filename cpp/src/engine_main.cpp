@@ -122,6 +122,25 @@ int main(const int argc, char** argv) {
       std::stoull(Argument(argc, argv, "--prefix-cache-entries", "1024"));
   config.result_cache_entries =
       std::stoull(Argument(argc, argv, "--result-cache-entries", "1024"));
+  const std::string policy = Argument(argc, argv, "--policy", "continuous");
+  if (policy != "continuous" && policy != "static") {
+    std::cerr << "--policy must be continuous or static\n";
+    return EXIT_FAILURE;
+  }
+  config.admission = policy == "static" ? infersched::engine::AdmissionPolicy::kStatic
+                                        : infersched::engine::AdmissionPolicy::kContinuous;
+  // Phenomenological cost model (microseconds). Defaults keep the historical
+  // engine model; experiments pass a heavier one with --time-scale 1.
+  const auto micros = [&](const std::string& name, const std::string& fallback) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::duration<double, std::micro>(std::stod(Argument(argc, argv, name, fallback))));
+  };
+  config.cost_model.prefill_fixed = micros("--prefill-fixed-us", "10");
+  config.cost_model.prefill_per_token = micros("--prefill-per-token-us", "1");
+  config.cost_model.decode_fixed = micros("--decode-fixed-us", "5");
+  config.cost_model.decode_per_sequence = micros("--decode-per-seq-us", "2");
+  config.cost_model.jitter_basis_points =
+      static_cast<std::uint32_t>(std::stoul(Argument(argc, argv, "--jitter-bp", "0")));
 
   infersched::distributed::EngineServiceOptions options;
   options.queue_capacity = std::stoull(Argument(argc, argv, "--queue-capacity", "1024"));
@@ -130,6 +149,7 @@ int main(const int argc, char** argv) {
       std::stoll(Argument(argc, argv, "--batch-delay-ms", "0")));
   // Wall-clock pacing of the cost model: 1.0 = simulated time is real time.
   options.time_scale = std::stod(Argument(argc, argv, "--time-scale", "0"));
+  options.cancellation = Argument(argc, argv, "--cancellation", "on") != "off";
 
   infersched::distributed::EngineService service(config, options);
   grpc::ServerBuilder builder;
@@ -180,5 +200,7 @@ int main(const int argc, char** argv) {
   }
   heartbeat.join();
   server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(2));
+  // Last stdout line: compute-efficiency counters for experiments.
+  std::cout << service.UtilizationJson(engine_id) << std::endl;
   return EXIT_SUCCESS;
 }
