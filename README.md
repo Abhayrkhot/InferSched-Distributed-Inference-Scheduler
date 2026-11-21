@@ -13,11 +13,14 @@ The project combines:
 - paged KV memory, radix prefix caching, result caching, and preemption;
 - PostgreSQL for authoritative lifecycle state, fencing, and the transactional outbox;
 - Redis for disposable prefix-affinity hints that are not part of the correctness boundary; and
-- span export to Kafka (`inference.traces`) plus Prometheus metrics at the gateway.
+- span export to Kafka (`inference.traces`) plus Prometheus metrics at the gateway; and
+- an optional real-model backend: llama.cpp runs a GGUF model on exactly the batches the Engine
+  schedules, with the scheduler's paged KV cache and prefix cache backing real KV memory.
 
-> InferSched does not execute a neural network or GPU kernel. Engines use a documented,
-> deterministic phenomenological cost model. Scheduler throughput and simulated latency results
-> characterize the scheduling system, not model inference throughput.
+> By default, Engines run a documented, deterministic phenomenological cost model, and the
+> scheduler-throughput and compute-efficiency tables below characterize the scheduling system
+> under that model. [Real-model serving](#real-model-serving) reports measured inference
+> throughput, latency and GPU utilization with the llama.cpp backend on a real GPU.
 
 ## What the project demonstrates
 
@@ -106,7 +109,37 @@ and repeat runs are in [`docs/p9-compute-efficiency.md`](docs/p9-compute-efficie
 Two findings cut the other way. Continuous admission charges each new prefill into the running
 batch, which raises p99 on prefill-heavy workloads (chunked prefill is not implemented). Sending all
 traffic to one Engine uses about 60% less compute than any spreading policy, so spreading is a
-latency choice, not a saving. "Compute" is the cost model's modeled time, not GPU kernels.
+latency choice, not a saving. "Compute" here is the cost model's modeled time, not GPU kernels;
+the next section measures real kernels.
+
+## Real-model serving
+
+With the llama.cpp backend, the Engine's scheduler runs a real model. Measured on one NVIDIA
+H200 with Qwen3-8B (FP16) and llama.cpp b12188 executing the Engine's batches. Load is 600
+open-loop requests per point, prompts of 128–512 tokens, and outputs that are 80% short (16–64)
+and 20% long (256–512). llama-server and vLLM served the identical token-id requests.
+
+| Comparison | Result |
+|---|---|
+| Continuous vs request-level vs one at a time, 256-request burst | 1,683 vs 1,251 vs 179 output tok/s; 0.27 vs 0.38 vs 3.56 J of GPU energy per output token |
+| Open-loop load at 17.4 offered QPS | Continuous serves 14.6 req/s at 60 ms median TTFT; request-level saturates at 11.0 req/s with 8.0 s median TTFT |
+| Same requests on llama-server (same llama.cpp build and kernels) | Saturates near 7.3 req/s with the GPU busy 42–48%; InferSched serves 1.96× more at 17.4 QPS |
+| Same requests on vLLM 0.34 | Request throughput within 1–4% up to 15.1 QPS; vLLM's time per output token is 1.6–3.4× lower |
+| Prefix cache on vs off, 8 shared 512-token prompts | Prompt tokens computed −85%, TTFT p50 −59%; GPU busy time only −5% |
+| Cost model fitted to 4,298 measured steps | 6.5 ms + 0.28 ms per sequence + 55 µs per prompt token; the simulator then predicts measured capacity within 3–11% |
+
+NVML "GPU busy" read 90–98% under every batching policy, so the table compares tokens and joules
+instead. Caveats:
+
+- InferSched is measured in-process, while llama-server and vLLM are measured through their HTTP
+  APIs.
+- CUDA graphs are off for every llama.cpp run, because b12188 crashes with them on the H200 for
+  large steps.
+- The full HTTP → Kafka → Router → Engine → Postgres path with a real model was checked only on
+  CPU.
+
+Details, caveats, the calibration of the cost model against these measurements, and how to
+reproduce them are in [`docs/p10-real-model-serving.md`](docs/p10-real-model-serving.md).
 
 ## Reliability model
 
@@ -163,6 +196,14 @@ cmake --preset tsan && cmake --build build/tsan && ctest --preset tsan
 Tests labelled `live` need Kafka, PostgreSQL, and Redis (`docker compose up -d`); run only the
 hermetic ones with `ctest --preset default -LE live`.
 
+The real-model backend is a separate build that fetches the pinned llama.cpp release:
+
+```bash
+cmake --preset llama-cpu && cmake --build build/llama-cpu     # CPU; what CI runs
+INFERSCHED_TEST_MODEL=models/stories260K.gguf ctest --preset llama-cpu -L llama
+cmake --preset llama-cuda && cmake --build build/llama-cuda   # needs nvcc; docker/gpu.Dockerfile
+```
+
 ## Infrastructure
 
 ```bash
@@ -183,6 +224,11 @@ PYTHONPATH=python .venv/bin/python -m uvicorn infersched_api.app:app --port 8000
 PYTHONPATH=python .venv/bin/python python/loadgen.py --url http://127.0.0.1:8000 --qps 200 --requests 2000
 ```
 
+With the llama.cpp build, `--backend llama --model <file.gguf>` makes an Engine run the model
+(KV capacity is still `--kv-blocks` × 16 tokens). `infersched_real_serving_bench` drives one Engine
+in wall-clock time; `scripts/exp_real_serving.py` runs the P10 experiments and
+`scripts/bench_openai_like.py` replays the same workload against llama-server or vLLM.
+
 Benchmarks: `scripts/run_p7_distributed_bench.sh` (full HTTP path) and `scripts/run_router_burst.sh`
 (Router path only). Efficiency experiments: `scripts/exp_batching_policy.sh` (deterministic) and
 `scripts/exp_fleet_efficiency.py` (live services). Engines print their compute counters as a JSON
@@ -198,4 +244,5 @@ for these experiments. The Router takes `--routing least-loaded|round-robin|firs
 - [`docs/p7-control-plane-observability.md`](docs/p7-control-plane-observability.md): gateway, load generation, and metrics
 - [`docs/p8-multi-engine-routing.md`](docs/p8-multi-engine-routing.md): multi-Engine dispatch, retries, cancellation, Redis hints, tracing
 - [`docs/p9-compute-efficiency.md`](docs/p9-compute-efficiency.md): compute accounting and one-variable efficiency experiments
+- [`docs/p10-real-model-serving.md`](docs/p10-real-model-serving.md): llama.cpp backend, measured serving throughput, and cost-model calibration
 - [`docs/benchmarks.md`](docs/benchmarks.md): reproducible measurements and claim boundaries

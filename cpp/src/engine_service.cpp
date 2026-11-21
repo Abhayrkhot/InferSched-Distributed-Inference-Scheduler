@@ -5,6 +5,7 @@
 #include <string>
 #include <utility>
 
+#include "infersched/engine/prompt_blocks.hpp"
 #include "infersched/util/json.hpp"
 
 namespace infersched::distributed {
@@ -21,9 +22,14 @@ bool RetryableFailure(const std::string& reason) {
 }  // namespace
 
 EngineService::EngineService(engine::EngineConfig config,
-                             EngineServiceOptions options)
+                             EngineServiceOptions options,
+                             std::unique_ptr<engine::StepExecutor> executor)
     : config_(config), options_(options), free_kv_blocks_(config.kv_blocks),
-      engine_(config), worker_(&EngineService::WorkerLoop, this) {}
+      engine_(config, std::move(executor)) {
+  backend_ = std::string(engine_.executor().name());
+  measured_ = engine_.executor().measured();
+  worker_ = std::thread(&EngineService::WorkerLoop, this);
+}
 
 EngineService::~EngineService() {
   {
@@ -157,10 +163,11 @@ std::string EngineService::UtilizationJson(const std::string& engine_id) const {
                     .count();
   }
   // Wall-clock busy time is modeled time paced by time_scale (plus any fixed
-  // per-iteration delay, which is not modeled compute and is excluded).
+  // per-iteration delay, which is not modeled compute and is excluded). A
+  // real-model executor measures it directly.
+  const double scale = measured_ ? 1.0 : options_.time_scale;
   const double busy_wall_ms =
-      std::chrono::duration<double, std::milli>(engine.simulated_busy_time).count() *
-      options_.time_scale;
+      std::chrono::duration<double, std::milli>(engine.simulated_busy_time).count() * scale;
   // Output that reached a live client. With cancellation off, abandoned
   // attempts still complete inside the engine; they are not useful work.
   const std::uint64_t useful =
@@ -170,6 +177,8 @@ std::string EngineService::UtilizationJson(const std::string& engine_id) const {
   const double busy_s = std::chrono::duration<double>(engine.simulated_busy_time).count();
   util::JsonObject json;
   json.Add("engine_id", engine_id)
+      .Add("backend", backend_)
+      .Add("measured", measured_)
       .Add("policy", config_.admission == engine::AdmissionPolicy::kStatic ? "static"
                                                                            : "continuous")
       .Add("cancellation", options_.cancellation)
@@ -188,6 +197,9 @@ std::string EngineService::UtilizationJson(const std::string& engine_id) const {
       .Add("preemptions", engine.preemptions)
       .AddRaw("mean_batch_occupancy", std::to_string(engine.mean_batch_occupancy()))
       .Add("peak_running", stats_.peak_running)
+      // busy_ms is measured with a real-model backend ("measured": true) and
+      // modeled otherwise; the modeled_* names are kept for the P9 scripts.
+      .AddRaw("busy_ms", ms(engine.simulated_busy_time))
       .AddRaw("modeled_busy_ms", ms(engine.simulated_busy_time))
       .AddRaw("modeled_prefill_ms", ms(engine.simulated_prefill_time))
       .AddRaw("modeled_decode_ms", ms(engine.simulated_decode_time))
@@ -196,10 +208,20 @@ std::string EngineService::UtilizationJson(const std::string& engine_id) const {
       .AddRaw("time_scale", std::to_string(options_.time_scale))
       .AddRaw("window_ms", std::to_string(window_ms))
       .AddRaw("busy_fraction",
-              std::to_string(window_ms > 0.0 && options_.time_scale > 0.0
+              std::to_string(window_ms > 0.0 && scale > 0.0
                                  ? busy_wall_ms / window_ms
                                  : 0.0));
   return json.str();
+}
+
+std::optional<std::pair<std::chrono::steady_clock::time_point,
+                        std::chrono::steady_clock::time_point>>
+EngineService::ActiveWindow() const {
+  std::lock_guard lock(mutex_);
+  if (!first_accept_.has_value() || !last_finish_.has_value()) {
+    return std::nullopt;
+  }
+  return std::make_pair(*first_accept_, *last_finish_);
 }
 
 std::string EngineService::ValidateAndReserve(
@@ -343,7 +365,7 @@ void EngineService::WorkerLoop() {
     // Optional wall-clock pacing so simulated cost (and test-only fixed
     // delays) turn into real time spent per iteration. Interruptible by stop.
     std::chrono::microseconds pace = options_.step_delay;
-    if (options_.time_scale > 0.0) {
+    if (options_.time_scale > 0.0 && !measured_) {
       pace += std::chrono::duration_cast<std::chrono::microseconds>(
           std::chrono::duration<double, std::nano>(
               static_cast<double>(simulated.count()) * options_.time_scale));
@@ -452,25 +474,9 @@ engine::EngineRequest EngineService::ToEngineRequest(
       .top_p_micros = static_cast<std::uint64_t>(
           std::max(0.0, request.sampling().top_p()) * 1'000'000.0)};
 
-  // Simulated block hashes: full blocks inside the shared prefix hash by
-  // (prefix_id, block index) so requests sharing a prefix share KV blocks;
-  // the remaining blocks hash by the request's own prompt.
-  const std::size_t block = config_.kv_block_size_tokens;
-  const std::size_t blocks = (converted.prompt_tokens + block - 1) / block;
-  const std::size_t shared_tokens =
-      request.prefix_id().empty()
-          ? 0
-          : std::min<std::size_t>(request.prefix_tokens(), converted.prompt_tokens);
-  converted.prompt_block_hashes.reserve(blocks);
-  for (std::size_t index = 0; index < blocks; ++index) {
-    if ((index + 1) * block <= shared_tokens) {
-      converted.prompt_block_hashes.push_back("p:" + request.prefix_id() + ':' +
-                                              std::to_string(index));
-    } else {
-      converted.prompt_block_hashes.push_back("u:" + request.prompt_hash() + ':' +
-                                              std::to_string(index));
-    }
-  }
+  converted.prompt_block_hashes = engine::PromptBlockHashes(
+      request.prompt_hash(), request.prefix_id(), request.prefix_tokens(),
+      converted.prompt_tokens, config_.kv_block_size_tokens);
   return converted;
 }
 

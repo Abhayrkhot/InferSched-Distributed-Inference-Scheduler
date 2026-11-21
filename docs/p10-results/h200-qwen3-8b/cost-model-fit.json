@@ -1,0 +1,25 @@
+{
+  "steps": 4298,
+  "decode_only_steps": 3944,
+  "batch_sizes_seen": [
+    0,
+    64
+  ],
+  "cost_model": {
+    "fixed_us": 6480.6,
+    "per_sequence_us": 284.52,
+    "per_prompt_token_us": 55.157,
+    "r2": 0.918,
+    "median_abs_pct_error": 5.9,
+    "p90_abs_pct_error": 25.3
+  },
+  "with_attention_term": {
+    "fixed_us": 6688.3,
+    "per_sequence_us": 578.18,
+    "per_prompt_token_us": 54.241,
+    "per_context_token_us": -0.66393,
+    "r2": 0.9278,
+    "median_abs_pct_error": 5.1,
+    "p90_abs_pct_error": 24.8
+  }
+}

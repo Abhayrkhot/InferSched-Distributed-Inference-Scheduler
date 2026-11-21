@@ -35,8 +35,13 @@ struct Arguments {
   bool telemetry{true};
   std::string cache{"none"};
   std::string policy{"continuous"};   // open_loop: continuous | static
-  std::string cost_model{"p7"};       // open_loop: p7 | memory-bound
-  std::string workload{"short"};      // open_loop: short | mixed
+  std::string cost_model{"p7"};       // open_loop: p7 | memory-bound | h200-qwen3-8b
+  std::string workload{"short"};      // open_loop: short | mixed | p10
+  // open_loop batch limits; 0 keeps BenchmarkConfig()'s value.
+  std::size_t max_batch{0};
+  std::size_t max_batch_tokens{0};
+  std::size_t max_prefill_seqs{0};
+  std::size_t kv_blocks{0};
 };
 
 infersched::engine::EngineConfig BenchmarkConfig();
@@ -88,6 +93,14 @@ Arguments ParseArguments(const int argc, char** argv) {
       arguments.cost_model = value;
     } else if (argument == "--workload") {
       arguments.workload = value;
+    } else if (argument == "--max-batch") {
+      arguments.max_batch = ParseSize(value, "max batch");
+    } else if (argument == "--max-batch-tokens") {
+      arguments.max_batch_tokens = ParseSize(value, "max batch tokens");
+    } else if (argument == "--max-prefill-seqs") {
+      arguments.max_prefill_seqs = ParseSize(value, "max prefill sequences");
+    } else if (argument == "--kv-blocks") {
+      arguments.kv_blocks = ParseSize(value, "KV blocks");
     } else {
       std::cerr << "unknown argument: " << argument << '\n';
       std::exit(EXIT_FAILURE);
@@ -111,8 +124,18 @@ void RunOpenLoop(const Arguments& arguments) {
     // step), as on bandwidth-bound accelerators: batching is nearly free.
     config.cost_model.decode_fixed = std::chrono::microseconds(500);
     config.cost_model.decode_per_sequence = std::chrono::microseconds(10);
+  } else if (arguments.cost_model == "h200-qwen3-8b") {
+    // Least-squares fit of measured llama.cpp steps (Qwen3-8B F16 on an
+    // H200; docs/p10-results/h200-qwen3-8b/cost-model-fit.json): a fused
+    // step costs 6,481 us + 285 us per decoding sequence + 55 us per prompt
+    // token. Prompt work has no separate fixed cost because it rides in the
+    // decode step.
+    config.cost_model.prefill_fixed = std::chrono::nanoseconds(0);
+    config.cost_model.prefill_per_token = std::chrono::nanoseconds(55'157);
+    config.cost_model.decode_fixed = std::chrono::nanoseconds(6'480'600);
+    config.cost_model.decode_per_sequence = std::chrono::nanoseconds(284'520);
   } else if (arguments.cost_model != "p7") {
-    std::cerr << "--cost-model must be p7 or memory-bound\n";
+    std::cerr << "--cost-model must be p7, memory-bound or h200-qwen3-8b\n";
     std::exit(EXIT_FAILURE);
   }
   if (arguments.policy == "static") {
@@ -121,9 +144,25 @@ void RunOpenLoop(const Arguments& arguments) {
     std::cerr << "--policy must be continuous or static\n";
     std::exit(EXIT_FAILURE);
   }
-  config.cost_model.jitter_basis_points = 200;
-  config.kv_blocks = 16'384;
+  config.cost_model.jitter_basis_points = arguments.cost_model == "h200-qwen3-8b" ? 0 : 200;
+  config.kv_blocks = arguments.kv_blocks != 0 ? arguments.kv_blocks : 16'384;
   config.prefix_cache_entries = 1024;
+  if (arguments.max_batch != 0) {
+    config.max_batch_sequences = arguments.max_batch;
+  }
+  if (arguments.max_batch_tokens != 0) {
+    config.max_batch_tokens = arguments.max_batch_tokens;
+  }
+  if (arguments.max_prefill_seqs != 0) {
+    config.max_prefill_sequences_per_iteration = arguments.max_prefill_seqs;
+  }
+  if (arguments.policy == "static" && arguments.max_batch != 0) {
+    // As in infersched_real_serving_bench: a request-level batch is admitted
+    // whole, not capped by the per-step prompt budget.
+    config.max_prefill_sequences_per_iteration = config.max_batch_sequences;
+    config.max_batch_tokens = std::max<std::size_t>(config.max_batch_tokens,
+                                                    config.max_batch_sequences * 1024);
+  }
   infersched::engine::ContinuousEngine engine(config);
 
   std::mt19937_64 random(arguments.seed);
@@ -146,8 +185,16 @@ void RunOpenLoop(const Arguments& arguments) {
       request.max_output_tokens =
           mix % 5 == 0 ? 64 + static_cast<std::size_t>(mix % 449)
                        : 1 + static_cast<std::size_t>(mix % 16);
+    } else if (arguments.workload == "p10") {
+      // The real-model workload (docs/p10-real-model-serving.md): prompts of
+      // 128-512 tokens; 80% of outputs 16-64 tokens, 20% 256-512.
+      const std::uint64_t mix = (static_cast<std::uint64_t>(index) * 2654435761ULL) >> 7;
+      const std::uint64_t mix2 = (static_cast<std::uint64_t>(index) * 40503ULL + 12345ULL) >> 3;
+      request.prompt_tokens = 128 + static_cast<std::size_t>(mix2 % 385);
+      request.max_output_tokens = mix % 5 == 0 ? 256 + static_cast<std::size_t>(mix % 257)
+                                               : 16 + static_cast<std::size_t>(mix % 49);
     } else if (arguments.workload != "short") {
-      std::cerr << "--workload must be short or mixed\n";
+      std::cerr << "--workload must be short, mixed or p10\n";
       std::exit(EXIT_FAILURE);
     }
     if ((arguments.cache == "result" || arguments.cache == "both") &&

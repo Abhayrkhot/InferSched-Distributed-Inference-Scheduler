@@ -31,6 +31,9 @@ struct EngineConfig {
   std::size_t max_prefill_sequences_per_iteration{1};
   std::size_t result_cache_entries{128};
   std::size_t prefix_cache_entries{128};
+  // ContinuousEngine only: false disables radix prefix matching (for A/B
+  // runs on identical prompts).
+  bool prefix_caching{true};
   std::uint64_t seed{1};
   CostModelConfig cost_model{};
 };

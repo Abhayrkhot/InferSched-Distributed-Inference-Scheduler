@@ -8,3 +8,9 @@ add_test(
           $<TARGET_FILE:infersched_local_bench>)
 set_tests_properties(Experiments.ContinuousBatchingOutperformsStaticOnMixedWorkload
   PROPERTIES TIMEOUT 60 LABELS hermetic)
+
+if(INFERSCHED_WITH_LLAMA)
+  # Real-model serving benchmark (docs/p10-real-model-serving.md).
+  add_executable(infersched_real_serving_bench real_serving_bench.cpp)
+  target_link_libraries(infersched_real_serving_bench PRIVATE infersched_llama)
+endif()

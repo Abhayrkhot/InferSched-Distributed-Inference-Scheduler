@@ -2,10 +2,12 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace infersched::engine {
@@ -43,15 +45,24 @@ class PagedKvCache {
       std::string_view sequence_id) const noexcept;
   [[nodiscard]] std::uint32_t RefCount(BlockId block) const noexcept;
 
+  // Called whenever a block's reference count drops to zero, before the block
+  // can be handed out again. Lets an executor drop the KV that backs it.
+  void SetFreeListener(std::function<void(BlockId)> listener) {
+    free_listener_ = std::move(listener);
+  }
+
   // Expensive by design: tests call this after every randomized operation.
   [[nodiscard]] bool CheckInvariants() const noexcept;
 
  private:
+  void ReleaseBlock(BlockId block) noexcept;
+
   std::size_t block_size_tokens_;
   std::vector<std::uint32_t> refcounts_;
   std::vector<BlockId> free_list_;
   std::unordered_map<std::string, std::vector<BlockId>> sequence_blocks_;
   std::unordered_map<std::string, std::vector<BlockId>> prefix_blocks_;
+  std::function<void(BlockId)> free_listener_;
 };
 
 }  // namespace infersched::engine
