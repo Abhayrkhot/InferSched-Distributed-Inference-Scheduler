@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <chrono>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -16,6 +17,7 @@
 #include "infersched/engine/radix_prefix_cache.hpp"
 #include "infersched/engine/result_cache.hpp"
 #include "infersched/engine/request_queue.hpp"
+#include "infersched/engine/step_executor.hpp"
 
 namespace infersched::engine {
 
@@ -29,6 +31,8 @@ struct ContinuousEngineStats {
   std::size_t result_cache_requests{};
   std::size_t result_cache_request_hits{};
   std::size_t peak_pending_requests{};
+  // Compute time: modeled by the cost model, or measured wall time when the
+  // executor runs a real model (see StepExecutor::measured()).
   std::chrono::nanoseconds simulated_busy_time{};
 
   // Compute accounting (all in tokens of modeled work).
@@ -62,7 +66,14 @@ struct ContinuousEngineStats {
 
 class ContinuousEngine {
  public:
-  explicit ContinuousEngine(EngineConfig config);
+  // `executor` performs the scheduled work; null means the cost model.
+  explicit ContinuousEngine(EngineConfig config,
+                            std::unique_ptr<StepExecutor> executor = nullptr);
+  ~ContinuousEngine();
+  ContinuousEngine(const ContinuousEngine&) = delete;
+  ContinuousEngine& operator=(const ContinuousEngine&) = delete;
+  ContinuousEngine(ContinuousEngine&&) = delete;
+  ContinuousEngine& operator=(ContinuousEngine&&) = delete;
 
   void Submit(EngineRequest request);
   [[nodiscard]] bool RunOneIteration();
@@ -88,6 +99,8 @@ class ContinuousEngine {
     return stats_;
   }
   [[nodiscard]] const FakeClock& clock() const noexcept { return clock_; }
+  [[nodiscard]] const StepExecutor& executor() const noexcept { return *executor_; }
+  [[nodiscard]] StepExecutor& executor() noexcept { return *executor_; }
   [[nodiscard]] const PagedKvCache& kv_cache() const noexcept { return kv_cache_; }
   [[nodiscard]] std::size_t pending_count() const noexcept { return pending_.size(); }
   [[nodiscard]] std::size_t active_count() const noexcept { return active_.size(); }
@@ -117,12 +130,14 @@ class ContinuousEngine {
       const EngineRequest& request) const noexcept;
   [[nodiscard]] std::string ResultKey(const EngineRequest& request) const;
   [[nodiscard]] std::string PrefixNamespace(const EngineRequest& request) const;
-  [[nodiscard]] std::string SimulatedOutput(const EngineRequest& request) const;
   void ForgetRequest(const std::string& request_id);
+  // Frees the sequence's KV blocks and tells the executor it left the batch.
+  void ReleaseSequence(const std::string& request_id);
 
   EngineConfig config_;
+  // Declared before the caches so it outlives their destructors.
+  std::unique_ptr<StepExecutor> executor_;
   FakeClock clock_;
-  DeterministicCostModel cost_model_;
   PagedKvCache kv_cache_;
   RadixPrefixCache prefix_cache_;
   ResultCache result_cache_;
@@ -133,6 +148,8 @@ class ContinuousEngine {
   ContinuousEngineStats stats_;
   std::unordered_set<std::string> preempted_requests_;
   std::unordered_set<std::string> prefix_accounted_requests_;
+  std::vector<std::string_view> decode_ids_;
+  std::vector<PagedKvCache::BlockId> release_blocks_;
 };
 
 }  // namespace infersched::engine

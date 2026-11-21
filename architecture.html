@@ -539,8 +539,9 @@
       Routers and Engines, schedules continuous batches, and safely recovers from failures.
     </p>
     <div class="notice">
-      InferSched simulates model execution with a deterministic cost model. Its measurements describe
-      scheduler behavior and distributed correctness, not real GPU inference throughput.
+      By default InferSched simulates model execution with a deterministic cost model, so most
+      measurements describe scheduler behavior and distributed correctness. Stage 10 adds a llama.cpp
+      backend that runs a real model on the same batches; its rows below are measured on a GPU.
     </div>
   </header>
 
@@ -917,6 +918,29 @@
             </div>
           </div>
         </details>
+
+        <details class="work-item">
+          <summary>
+            <span class="phase-number">10</span>
+            <span class="phase-title">Real-model serving</span>
+            <span class="phase-goal">Run a real model on the scheduler's batches and measure serving throughput, latency, and GPU utilization.</span>
+            <span class="status">Implemented</span>
+          </summary>
+          <div class="work-body">
+            <div>
+              <h4>Understand</h4>
+              <p>A StepExecutor seam separates scheduling decisions from execution. The llama.cpp executor turns each iteration into one fused prefill+decode call, backs the paged KV cache with real cells, and shares cached prefixes through sequence tags instead of copies.</p>
+            </div>
+            <div>
+              <h4>Read</h4>
+              <p><code>step_executor.hpp</code>, <code>llama_executor.cpp</code>, <code>real_serving_bench.cpp</code>, <code>scripts/exp_real_serving.py</code>, and <code>docs/p10-real-model-serving.md</code>.</p>
+            </div>
+            <div>
+              <h4>Evidence</h4>
+              <p>On an H200 with Qwen3-8B, continuous batching delivers 1.35&times; the tokens per GPU-second of request-level batching and 9.4&times; that of serial serving, for 30% less energy per token than request-level batching; it matches vLLM's request throughput within 1&ndash;4% on identical requests, and prefix caching cuts prompt compute by 85%. Real-model tests check that reused prefix KV gives the same greedy output as recomputing it, and that no KV cell leaks.</p>
+            </div>
+          </div>
+        </details>
       </div>
     </section>
 
@@ -981,6 +1005,21 @@
               <td>Cancellation of abandoned attempts (Linux host)</td>
               <td>10% of requests miss a 60 ms deadline</td>
               <td>Hardware time −34% to −42% for the same completions</td>
+            </tr>
+            <tr>
+              <td>Real model, batching policy (H200, Qwen3-8B FP16)</td>
+              <td>256-request burst, llama.cpp executing the Engine's batches</td>
+              <td>1,683 vs 1,251 vs 179 output tok/s (continuous, request-level, serial); 0.27 vs 0.38 vs 3.56 J per token</td>
+            </tr>
+            <tr>
+              <td>Real model vs llama-server and vLLM (H200)</td>
+              <td>Identical token-id requests, open loop up to 17.4 QPS</td>
+              <td>1.96&times; llama-server's throughput on the same kernels; within 1&ndash;4% of vLLM up to 15.1 QPS, at 1.6&ndash;3.4&times; vLLM's time per token</td>
+            </tr>
+            <tr>
+              <td>Cost model calibrated to measured steps (H200)</td>
+              <td>4,298 steps fitted; simulator rerun on the same workload</td>
+              <td>Predicts measured capacity within 3&ndash;11%; real batching gain 1.35&times; vs the calibrated model's 1.43&times;</td>
             </tr>
           </tbody>
         </table>

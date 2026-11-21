@@ -31,12 +31,35 @@
         "CMAKE_BUILD_TYPE": "Debug",
         "INFERSCHED_SANITIZER": "thread"
       }
+    },
+    {
+      "name": "llama-cuda",
+      "inherits": "base",
+      "displayName": "Real-model backend: llama.cpp + CUDA (Release)",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "INFERSCHED_WITH_LLAMA": "ON",
+        "INFERSCHED_LLAMA_CUDA": "ON",
+        "CMAKE_CUDA_ARCHITECTURES": "native"
+      }
+    },
+    {
+      "name": "llama-cpu",
+      "inherits": "base",
+      "displayName": "Real-model backend: llama.cpp on CPU (tests and CI)",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "INFERSCHED_WITH_LLAMA": "ON",
+        "INFERSCHED_LLAMA_CUDA": "OFF"
+      }
     }
   ],
   "buildPresets": [
     { "name": "default", "configurePreset": "default" },
     { "name": "asan", "configurePreset": "asan" },
-    { "name": "tsan", "configurePreset": "tsan" }
+    { "name": "tsan", "configurePreset": "tsan" },
+    { "name": "llama-cuda", "configurePreset": "llama-cuda" },
+    { "name": "llama-cpu", "configurePreset": "llama-cpu" }
   ],
   "testPresets": [
     {
@@ -52,6 +75,11 @@
     {
       "name": "tsan",
       "configurePreset": "tsan",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "llama-cpu",
+      "configurePreset": "llama-cpu",
       "output": { "outputOnFailure": true }
     }
   ]

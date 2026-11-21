@@ -26,9 +26,12 @@ void AppendPart(std::string& output, const std::string_view value) {
 
 }  // namespace
 
-ContinuousEngine::ContinuousEngine(EngineConfig config)
+ContinuousEngine::ContinuousEngine(EngineConfig config,
+                                   std::unique_ptr<StepExecutor> executor)
     : config_(config),
-      cost_model_(config.cost_model, config.seed),
+      executor_(executor != nullptr
+                    ? std::move(executor)
+                    : std::make_unique<CostModelExecutor>(config.cost_model, config.seed)),
       kv_cache_(config.kv_blocks, config.kv_block_size_tokens),
       prefix_cache_(config.prefix_cache_entries, kv_cache_),
       result_cache_(config.result_cache_entries) {
@@ -36,7 +39,14 @@ ContinuousEngine::ContinuousEngine(EngineConfig config)
       config.max_prefill_sequences_per_iteration == 0) {
     throw std::invalid_argument("continuous batching limits must be positive");
   }
+  if (executor_->tracks_sequences()) {
+    kv_cache_.SetFreeListener([executor = executor_.get()](const PagedKvCache::BlockId block) {
+      executor->OnBlockFreed(block);
+    });
+  }
 }
+
+ContinuousEngine::~ContinuousEngine() { kv_cache_.SetFreeListener(nullptr); }
 
 void ContinuousEngine::Submit(EngineRequest request) {
   pending_.Push(std::move(request));
@@ -57,7 +67,15 @@ bool ContinuousEngine::RunOneIteration() {
     return progressed;
   }
 
-  const auto decode_cost = cost_model_.DecodeStep(active_.size());
+  std::span<const std::string_view> sequence_ids;
+  if (executor_->tracks_sequences()) {
+    decode_ids_.clear();
+    for (const auto& active : active_) {
+      decode_ids_.emplace_back(active.request.request_id);
+    }
+    sequence_ids = decode_ids_;
+  }
+  const auto decode_cost = executor_->Decode(active_.size(), sequence_ids);
   clock_.Advance(decode_cost);
   stats_.simulated_busy_time += decode_cost;
   stats_.simulated_decode_time += decode_cost;
@@ -81,7 +99,7 @@ bool ContinuousEngine::Cancel(const std::string_view request_id,
     return entry.request.request_id == request_id;
   });
   if (active != active_.end()) {
-    static_cast<void>(kv_cache_.Free(active->request.request_id));
+    ReleaseSequence(active->request.request_id);
     stats_.wasted_decode_tokens += active->generated_tokens;
     stats_.wasted_prefill_tokens += active->prefilled_tokens;
     cancelled = active->request.request_id;
@@ -111,6 +129,17 @@ std::vector<std::string> ContinuousEngine::TakeFirstTokens() {
   std::vector<std::string> taken;
   taken.swap(first_tokens_);
   return taken;
+}
+
+void ContinuousEngine::ReleaseSequence(const std::string& request_id) {
+  if (!executor_->tracks_sequences()) {
+    static_cast<void>(kv_cache_.Free(request_id));
+    return;
+  }
+  const auto blocks = kv_cache_.BlocksFor(request_id);
+  release_blocks_.assign(blocks.begin(), blocks.end());
+  static_cast<void>(kv_cache_.Free(request_id));
+  executor_->Release(request_id, release_blocks_, kv_cache_);
 }
 
 void ContinuousEngine::ForgetRequest(const std::string& request_id) {
@@ -144,6 +173,8 @@ bool ContinuousEngine::AdmitReady() {
   const std::size_t scan_limit = pending_.size();
   std::vector<EngineRequest> deferred;
   deferred.reserve(scan_limit);
+  const bool computed_only = executor_->shares_only_computed_kv();
+  std::unordered_set<PagedKvCache::BlockId> admitted_blocks;  // This iteration.
   for (std::size_t scanned = 0;
        scanned < scan_limit && active_.size() < config_.max_batch_sequences;
        ++scanned) {
@@ -197,9 +228,19 @@ bool ContinuousEngine::AdmitReady() {
         candidate.prompt_block_hashes}.first(
         std::min(candidate.prompt_block_hashes.size(), prompt_blocks));
     std::optional<RadixPrefixCache::Match> match;
-    if (!candidate_hashes.empty()) {
+    if (!candidate_hashes.empty() && config_.prefix_caching) {
       match = prefix_cache_.GetLongest(PrefixNamespace(candidate),
                                        candidate_hashes);
+    }
+
+    if (computed_only && match.has_value() &&
+        std::ranges::any_of(match->blocks, [&](const PagedKvCache::BlockId block) {
+          return admitted_blocks.contains(block);
+        })) {
+      // Its prefix is being computed by this iteration's step; admit it
+      // next iteration so it shares that KV instead of recomputing it.
+      deferred.push_back(std::move(candidate));
+      continue;
     }
 
     PagedKvCache::AllocationStatus status =
@@ -214,7 +255,7 @@ bool ContinuousEngine::AdmitReady() {
           !prefix_cache_.EvictOldest()) {
         break;
       }
-      match = candidate_hashes.empty()
+      match = candidate_hashes.empty() || !config_.prefix_caching
                   ? std::nullopt
                   : prefix_cache_.GetLongest(PrefixNamespace(candidate),
                                              candidate_hashes);
@@ -242,17 +283,22 @@ bool ContinuousEngine::AdmitReady() {
         matched_blocks >= prompt_blocks
             ? active.request.prompt_tokens
             : matched_blocks * config_.kv_block_size_tokens;
-    const std::size_t uncached_tokens = active.request.prompt_tokens - cached_tokens;
-    const auto prefill_cost = cost_model_.Prefill(uncached_tokens);
-    clock_.Advance(prefill_cost);
-    stats_.simulated_busy_time += prefill_cost;
-    stats_.simulated_prefill_time += prefill_cost;
+    const PrefillResult prefill = executor_->Prefill(
+        PrefillWork{.request = &active.request,
+                    .blocks = kv_cache_.BlocksFor(active.request.request_id),
+                    .matched_blocks = matched_blocks,
+                    .cached_tokens = cached_tokens});
+    const std::size_t reused_tokens = std::min(prefill.reused_tokens, cached_tokens);
+    const std::size_t uncached_tokens = active.request.prompt_tokens - reused_tokens;
+    clock_.Advance(prefill.compute);
+    stats_.simulated_busy_time += prefill.compute;
+    stats_.simulated_prefill_time += prefill.compute;
     stats_.prefill_tokens_computed += uncached_tokens;
-    stats_.prefill_tokens_reused += cached_tokens;
+    stats_.prefill_tokens_reused += reused_tokens;
     active.prefilled_tokens = uncached_tokens;
     static_cast<void>(active.state.TransitionTo(ExecutionState::kDecode));
 
-    if (!active.request.prompt_block_hashes.empty()) {
+    if (!active.request.prompt_block_hashes.empty() && config_.prefix_caching) {
       const auto blocks = kv_cache_.BlocksFor(active.request.request_id);
       const auto hashes = std::span<const std::string>{
           active.request.prompt_block_hashes}.first(
@@ -260,6 +306,13 @@ bool ContinuousEngine::AdmitReady() {
       static_cast<void>(prefix_cache_.PutBlockPrefixes(
           PrefixNamespace(active.request), hashes,
           blocks.first(std::min(blocks.size(), prompt_blocks))));
+    }
+    if (computed_only) {
+      // Blocks this admission computes (matched ones were computed earlier).
+      const auto blocks = kv_cache_.BlocksFor(active.request.request_id);
+      admitted_blocks.insert(
+          blocks.begin() + static_cast<std::ptrdiff_t>(std::min(matched_blocks, blocks.size())),
+          blocks.end());
     }
     prefill_budget += active.request.prompt_tokens;
     active_.push_back(std::move(active));
@@ -316,9 +369,9 @@ void ContinuousEngine::CompleteFinished() {
       continue;
     }
     static_cast<void>(active.state.TransitionTo(ExecutionState::kCompleted));
-    const std::string output = SimulatedOutput(active.request);
+    const std::string output = executor_->Output(active.request);
     result_cache_.Put(ResultKey(active.request), output);
-    static_cast<void>(kv_cache_.Free(active.request.request_id));
+    ReleaseSequence(active.request.request_id);
     results_.push_back(EngineResult{.request_id = active.request.request_id,
                                     .output = output,
                                     .completed_at = clock_.Now(),
@@ -342,7 +395,7 @@ void ContinuousEngine::Preempt(const std::size_t active_index) {
   stats_.wasted_prefill_tokens += victim.prefilled_tokens;
   static_cast<void>(victim.state.TransitionTo(ExecutionState::kPreempted));
   static_cast<void>(victim.state.TransitionTo(ExecutionState::kWaitingAdmission));
-  static_cast<void>(kv_cache_.Free(victim.request.request_id));
+  ReleaseSequence(victim.request.request_id);
   victim.request.arrival_time = clock_.Now();
   preempted_requests_.insert(victim.request.request_id);
   pending_.Push(std::move(victim.request));
@@ -401,13 +454,6 @@ std::string ContinuousEngine::PrefixNamespace(
   AppendPart(output, request.model_revision);
   AppendPart(output, request.tokenizer_revision);
   return output;
-}
-
-std::string ContinuousEngine::SimulatedOutput(
-    const EngineRequest& request) const {
-  return "simulated:" + request.model_revision + ':' + request.prompt_hash + ':' +
-         std::to_string(request.max_output_tokens) + ':' +
-         std::to_string(request.sampling_seed);
 }
 
 }  // namespace infersched::engine

@@ -1,0 +1,3 @@
+NVIDIA H200, 570.86.15, 143771 MiB, 1980 MHz
+CPU(s):                             128
+Model name:                         INTEL(R) XEON(R) GOLD 6548Y+

@@ -13,6 +13,10 @@
 
 #include "infersched/distributed/engine_service.hpp"
 #include "infersched.grpc.pb.h"
+#ifdef INFERSCHED_HAVE_LLAMA
+#include "infersched/engine/gpu_monitor.hpp"
+#include "infersched/engine/llama_executor.hpp"
+#endif
 
 namespace {
 
@@ -122,6 +126,9 @@ int main(const int argc, char** argv) {
       std::stoull(Argument(argc, argv, "--prefix-cache-entries", "1024"));
   config.result_cache_entries =
       std::stoull(Argument(argc, argv, "--result-cache-entries", "1024"));
+  config.max_batch_tokens =
+      std::stoull(Argument(argc, argv, "--max-batch-tokens", "4096"));
+  config.prefix_caching = Argument(argc, argv, "--prefix-cache", "on") != "off";
   const std::string policy = Argument(argc, argv, "--policy", "continuous");
   if (policy != "continuous" && policy != "static") {
     std::cerr << "--policy must be continuous or static\n";
@@ -151,7 +158,45 @@ int main(const int argc, char** argv) {
   options.time_scale = std::stod(Argument(argc, argv, "--time-scale", "0"));
   options.cancellation = Argument(argc, argv, "--cancellation", "on") != "off";
 
-  infersched::distributed::EngineService service(config, options);
+  // Executor: the cost model (default) or a real model through llama.cpp.
+  const std::string backend = Argument(argc, argv, "--backend", "cost-model");
+  std::unique_ptr<infersched::engine::StepExecutor> executor;
+#ifdef INFERSCHED_HAVE_LLAMA
+  std::unique_ptr<infersched::engine::GpuMonitor> gpu;
+#endif
+  if (backend == "llama") {
+#ifdef INFERSCHED_HAVE_LLAMA
+    infersched::engine::LlamaExecutorConfig llama;
+    llama.model_path = Argument(argc, argv, "--model", "");
+    llama.gpu_layers = std::stoi(Argument(argc, argv, "--gpu-layers", "999"));
+    llama.kv_tokens = config.kv_blocks * config.kv_block_size_tokens;
+    llama.block_size_tokens = config.kv_block_size_tokens;
+    llama.max_sequences = config.max_batch_sequences;
+    llama.holder_sequences = std::stoull(Argument(argc, argv, "--holder-sequences", "32"));
+    llama.max_batch_tokens = config.max_batch_tokens;
+    llama.ubatch_tokens = std::stoull(Argument(argc, argv, "--ubatch-tokens", "512"));
+    llama.flash_attention = Argument(argc, argv, "--flash-attn", "on") != "off";
+    llama.threads = std::stoi(Argument(argc, argv, "--threads", "4"));
+    llama.backend_sampling = Argument(argc, argv, "--backend-sampling", "off") == "on";
+    try {
+      executor = std::make_unique<infersched::engine::LlamaExecutor>(llama);
+    } catch (const std::exception& error) {
+      std::cerr << "llama backend: " << error.what() << '\n';
+      return EXIT_FAILURE;
+    }
+    options.time_scale = 0.0;  // Real compute takes real time; no pacing.
+    gpu = std::make_unique<infersched::engine::GpuMonitor>();
+    gpu->Start();
+#else
+    std::cerr << "--backend llama needs a build with -DINFERSCHED_WITH_LLAMA=ON\n";
+    return EXIT_FAILURE;
+#endif
+  } else if (backend != "cost-model") {
+    std::cerr << "--backend must be cost-model or llama\n";
+    return EXIT_FAILURE;
+  }
+
+  infersched::distributed::EngineService service(config, options, std::move(executor));
   grpc::ServerBuilder builder;
   builder.AddListeningPort(listen, grpc::InsecureServerCredentials());
   builder.RegisterService(&service);
@@ -201,6 +246,23 @@ int main(const int argc, char** argv) {
   heartbeat.join();
   server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(2));
   // Last stdout line: compute-efficiency counters for experiments.
-  std::cout << service.UtilizationJson(engine_id) << std::endl;
+  std::string utilization = service.UtilizationJson(engine_id);
+#ifdef INFERSCHED_HAVE_LLAMA
+  if (gpu != nullptr && gpu->available()) {
+    const auto window = service.ActiveWindow();
+    const auto summary = window.has_value() ? gpu->Summarize(window->first, window->second)
+                                            : gpu->Stop();
+    utilization.pop_back();  // Extend the JSON object with GPU telemetry.
+    utilization += ",\"gpu_name\":\"" + summary.name + "\",\"gpu_samples\":" +
+                   std::to_string(summary.samples) + ",\"gpu_util_pct\":" +
+                   std::to_string(summary.mean_utilization_pct) +
+                   ",\"gpu_mem_util_pct\":" +
+                   std::to_string(summary.mean_memory_utilization_pct) +
+                   ",\"gpu_power_w\":" + std::to_string(summary.mean_power_w) +
+                   ",\"gpu_peak_used_mib\":" +
+                   std::to_string(summary.peak_used_bytes / (1024 * 1024)) + "}";
+  }
+#endif
+  std::cout << utilization << std::endl;
   return EXIT_SUCCESS;
 }

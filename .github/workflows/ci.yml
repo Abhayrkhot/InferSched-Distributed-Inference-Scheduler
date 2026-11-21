@@ -86,6 +86,54 @@ jobs:
           ASAN_OPTIONS: abort_on_error=1:detect_leaks=1
         run: ctest --test-dir build/asan -LE live --output-on-failure
 
+  llama-cpu:
+    # The real-model backend: llama.cpp (pinned b12188, CPU build) runs the
+    # scheduler's batches on a 260K-parameter model. Checks that scheduling,
+    # prefix reuse, preemption and cancellation stay consistent with real KV.
+    name: real-model-llama-cpu
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build pkg-config \
+            protobuf-compiler protobuf-compiler-grpc libprotobuf-dev \
+            libgrpc++-dev libabsl-dev libpq-dev librdkafka-dev libhiredis-dev
+
+      - name: Install libpqxx 8
+        run: |
+          git clone --depth 1 --branch 8.0.1 https://github.com/jtv/libpqxx.git /tmp/libpqxx
+          cmake -S /tmp/libpqxx -B /tmp/libpqxx-build -G Ninja -DSKIP_BUILD_TEST=ON
+          cmake --build /tmp/libpqxx-build --parallel
+          sudo cmake --install /tmp/libpqxx-build
+
+      - name: Download the test model
+        run: |
+          mkdir -p models
+          curl -fsSL -o models/stories260K.gguf \
+            https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories260K.gguf
+          echo "270cba1bd5109f42d03350f60406024560464db173c0e387d91f0426d3bd256d  models/stories260K.gguf" \
+            | sha256sum --check
+
+      - name: Configure and build
+        run: |
+          cmake --preset llama-cpu -G Ninja
+          cmake --build build/llama-cpu --parallel
+
+      - name: Real-model tests
+        env:
+          INFERSCHED_TEST_MODEL: ${{ github.workspace }}/models/stories260K.gguf
+        run: ctest --test-dir build/llama-cpu -L llama --output-on-failure
+
+      - name: Serving benchmark smoke run
+        run: |
+          build/llama-cpu/cpp/bench/infersched_real_serving_bench \
+            --model models/stories260K.gguf --gpu-layers 0 --requests 24 --warmup 2 \
+            --qps 0 --max-batch 8 --kv-blocks 256 --prompt-min 16 --prompt-max 64 \
+            --short-min 4 --short-max 16 --long-min 32 --long-max 64
+
   live-infrastructure:
     name: live-kafka-postgres-redis
     runs-on: ubuntu-24.04

@@ -203,7 +203,7 @@ was added, which is why p99 ingest is high: those are the first requests after a
 
 ### What these numbers do not show
 
-- No GPU or model execution; Engine time is a fixed per-iteration delay.
+- No GPU or model execution; Engine time is a fixed per-iteration delay (P10 measures a real model).
 - One Router and one gateway process on one host. This is not a horizontal scaling curve; adding
   Engines raises dispatch capacity but not the gateway or Router-ingest ceiling.
 - Shared-host noise affects tails. Re-run on a dedicated machine before quoting a p99.
@@ -212,3 +212,10 @@ was added, which is why p99 ingest is high: those are the first requests after a
 
 Batching policy, routing, prefix affinity, and cancellation measured as modeled compute per
 delivered token: [`p9-compute-efficiency.md`](p9-compute-efficiency.md).
+
+## P10 real-model serving
+
+The llama.cpp backend runs Qwen3-8B on the Engine's batches on an NVIDIA H200. It reports
+serving throughput, latency, GPU busy time and energy per token, compared with llama-server and
+vLLM on identical requests, plus a cost-model fit to the measured steps:
+[`p10-real-model-serving.md`](p10-real-model-serving.md).

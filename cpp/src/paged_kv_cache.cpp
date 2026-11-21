@@ -68,10 +68,7 @@ bool PagedKvCache::Free(const std::string_view sequence_id) noexcept {
     return false;
   }
   for (const BlockId block : iterator->second) {
-    --refcounts_[block];
-    if (refcounts_[block] == 0) {
-      free_list_.push_back(block);
-    }
+    ReleaseBlock(block);
   }
   sequence_blocks_.erase(iterator);
   return true;
@@ -123,13 +120,20 @@ bool PagedKvCache::UnpinPrefix(const std::string_view prefix_key) noexcept {
     return false;
   }
   for (const BlockId block : iterator->second) {
-    --refcounts_[block];
-    if (refcounts_[block] == 0) {
-      free_list_.push_back(block);
-    }
+    ReleaseBlock(block);
   }
   prefix_blocks_.erase(iterator);
   return true;
+}
+
+void PagedKvCache::ReleaseBlock(const BlockId block) noexcept {
+  --refcounts_[block];
+  if (refcounts_[block] == 0) {
+    free_list_.push_back(block);
+    if (free_listener_) {
+      free_listener_(block);
+    }
+  }
 }
 
 std::size_t PagedKvCache::total_blocks() const noexcept { return refcounts_.size(); }

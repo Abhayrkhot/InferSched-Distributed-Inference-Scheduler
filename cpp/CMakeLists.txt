@@ -19,6 +19,7 @@ add_library(infersched_core
   src/result_cache.cpp
   src/result_cache_key.cpp
   src/static_batch_policy.cpp
+  src/step_executor.cpp
   src/version.cpp)
 target_include_directories(infersched_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(infersched_core
@@ -49,11 +50,52 @@ target_link_libraries(infersched_coordination
   PUBLIC PkgConfig::HIREDIS
   PRIVATE infersched_warnings)
 
+# ---------------------------------------------------------------------------
+# Optional real-model backend: llama.cpp executes the scheduler's batches.
+# Off by default so the control-plane build and CI stay dependency-light.
+# ---------------------------------------------------------------------------
+option(INFERSCHED_WITH_LLAMA "Build the llama.cpp real-model Engine backend" OFF)
+option(INFERSCHED_LLAMA_CUDA "Build llama.cpp with CUDA (requires nvcc)" OFF)
+# Also build llama.cpp's own llama-server and llama-batched-bench from the same
+# pinned source and the same compiled kernels (the reference baselines).
+option(INFERSCHED_LLAMA_TOOLS "Build llama-server and llama-batched-bench too" OFF)
+if(INFERSCHED_WITH_LLAMA)
+  # Static, like the rest of the project (llama.cpp defaults to shared).
+  set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+  set(LLAMA_BUILD_COMMON ${INFERSCHED_LLAMA_TOOLS} CACHE BOOL "" FORCE)
+  set(LLAMA_BUILD_TOOLS ${INFERSCHED_LLAMA_TOOLS} CACHE BOOL "" FORCE)
+  set(LLAMA_BUILD_SERVER ${INFERSCHED_LLAMA_TOOLS} CACHE BOOL "" FORCE)
+  set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+  set(LLAMA_BUILD_APP OFF CACHE BOOL "" FORCE)
+  set(LLAMA_OPENSSL OFF CACHE BOOL "" FORCE)
+  set(LLAMA_USE_PREBUILT_UI OFF CACHE BOOL "" FORCE)  # No network at build time; no web UI.
+  set(GGML_CUDA ${INFERSCHED_LLAMA_CUDA} CACHE BOOL "" FORCE)
+  # Pinned release b12188 (2026-11-07); the same tag builds the reference
+  # llama-server used in docs/p10-real-model-serving.md.
+  FetchContent_Declare(
+    llama
+    URL      https://github.com/ggml-org/llama.cpp/archive/refs/tags/b12188.tar.gz
+    URL_HASH SHA256=56b07fdceb8641325759a097d43f9f6effc61b2c7c710cb3f61e331e2b1778c6
+    SYSTEM)
+  FetchContent_MakeAvailable(llama)
+
+  add_library(infersched_llama src/llama_executor.cpp src/gpu_monitor.cpp)
+  target_include_directories(infersched_llama PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(infersched_llama
+    PUBLIC  infersched_core llama
+    PRIVATE infersched_warnings ${CMAKE_DL_LIBS})
+  target_compile_definitions(infersched_llama PUBLIC INFERSCHED_HAVE_LLAMA=1)
+endif()
+
 add_subdirectory(tests)
 add_subdirectory(bench)
 
 add_executable(infersched_engine src/engine_main.cpp)
 target_link_libraries(infersched_engine PRIVATE infersched_core)
+if(INFERSCHED_WITH_LLAMA)
+  target_link_libraries(infersched_engine PRIVATE infersched_llama)
+endif()
 
 add_executable(infersched_router src/router_main.cpp)
 target_link_libraries(infersched_router PRIVATE infersched_core)

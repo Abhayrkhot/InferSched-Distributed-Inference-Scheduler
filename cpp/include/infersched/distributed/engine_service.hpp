@@ -45,8 +45,10 @@ struct EngineServiceOptions {
 // (iteration-level continuous batching across RPCs, not per-RPC batches).
 class EngineService final : public v1::EngineControl::Service {
  public:
+  // `executor` runs the scheduled work (null = the cost model).
   explicit EngineService(engine::EngineConfig config,
-                         EngineServiceOptions options = {});
+                         EngineServiceOptions options = {},
+                         std::unique_ptr<engine::StepExecutor> executor = nullptr);
   ~EngineService() override;
   EngineService(const EngineService&) = delete;
   EngineService& operator=(const EngineService&) = delete;
@@ -79,6 +81,11 @@ class EngineService final : public v1::EngineControl::Service {
   // busy time, batch occupancy, useful vs wasted tokens, prefill reuse) plus
   // wall-clock busy fraction over the window from first accept to last finish.
   [[nodiscard]] std::string UtilizationJson(const std::string& engine_id) const;
+  // Wall-clock window from the first accepted dispatch to the last terminal
+  // result, if any work ran.
+  [[nodiscard]] std::optional<std::pair<std::chrono::steady_clock::time_point,
+                                        std::chrono::steady_clock::time_point>>
+  ActiveWindow() const;
 
  private:
   struct Job {
@@ -104,6 +111,8 @@ class EngineService final : public v1::EngineControl::Service {
 
   const engine::EngineConfig config_;
   const EngineServiceOptions options_;
+  std::string backend_;  // Executor name, fixed at construction.
+  bool measured_{};      // Executor times are measured wall time.
 
   // Guarded by mutex_: hand-off state between RPC threads and the worker.
   mutable std::mutex mutex_;

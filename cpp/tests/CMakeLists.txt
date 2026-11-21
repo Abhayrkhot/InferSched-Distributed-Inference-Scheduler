@@ -23,6 +23,19 @@ target_link_libraries(infersched_distributed_test
   PRIVATE infersched_core infersched_coordination GTest::gtest_main)
 gtest_discover_tests(infersched_distributed_test PROPERTIES LABELS hermetic)
 
+add_executable(infersched_executor_contract_test executor_contract_test.cpp)
+target_link_libraries(infersched_executor_contract_test
+  PRIVATE infersched_core GTest::gtest_main)
+gtest_discover_tests(infersched_executor_contract_test PROPERTIES LABELS hermetic)
+
+if(INFERSCHED_WITH_LLAMA)
+  # Real-model tests; skipped unless INFERSCHED_TEST_MODEL names a GGUF file.
+  add_executable(infersched_llama_test llama_executor_test.cpp)
+  target_link_libraries(infersched_llama_test PRIVATE infersched_llama GTest::gtest_main)
+  # Listed at test time: a CUDA build needs the driver library to start.
+  gtest_discover_tests(infersched_llama_test PROPERTIES LABELS llama DISCOVERY_MODE PRE_TEST)
+endif()
+
 add_executable(infersched_coordination_test coordination_test.cpp)
 target_link_libraries(infersched_coordination_test
   PRIVATE infersched_coordination GTest::gtest_main)
