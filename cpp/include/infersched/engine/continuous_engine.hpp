@@ -30,6 +30,34 @@ struct ContinuousEngineStats {
   std::size_t result_cache_request_hits{};
   std::size_t peak_pending_requests{};
   std::chrono::nanoseconds simulated_busy_time{};
+
+  // Compute accounting (all in tokens of modeled work).
+  std::chrono::nanoseconds simulated_prefill_time{};
+  std::chrono::nanoseconds simulated_decode_time{};
+  // Sum over decode iterations of the batch size: decode tokens computed.
+  std::size_t decode_token_slots{};
+  // Output tokens of requests that completed successfully.
+  std::size_t useful_output_tokens{};
+  // Decode tokens thrown away: preempted sequences restart from scratch, and
+  // cancelled sequences produce nothing anyone accepts.
+  std::size_t wasted_decode_tokens{};
+  std::size_t prefill_tokens_computed{};  // Uncached prompt tokens prefilled.
+  std::size_t prefill_tokens_reused{};    // Served from the prefix cache.
+  std::size_t wasted_prefill_tokens{};    // Prefill of preempted/cancelled work.
+  std::size_t cancellations{};
+  std::size_t completed_requests{};
+
+  // Mean sequences per decode step: how full the batch was while decoding.
+  [[nodiscard]] double mean_batch_occupancy() const noexcept {
+    return iterations == 0 ? 0.0
+                           : static_cast<double>(decode_token_slots) /
+                                 static_cast<double>(iterations);
+  }
+  // Useful output tokens per second of modeled compute.
+  [[nodiscard]] double useful_tokens_per_busy_second() const noexcept {
+    const double busy = std::chrono::duration<double>(simulated_busy_time).count();
+    return busy == 0.0 ? 0.0 : static_cast<double>(useful_output_tokens) / busy;
+  }
 };
 
 class ContinuousEngine {
@@ -77,6 +105,7 @@ class ContinuousEngine {
     std::size_t generated_tokens{};
     bool prefix_cache_hit{};
     FakeClock::time_point first_token_at{};
+    std::size_t prefilled_tokens{};  // Uncached prompt tokens this admission computed.
   };
 
   [[nodiscard]] bool AdmitReady();

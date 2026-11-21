@@ -87,6 +87,7 @@ struct Options {
   std::chrono::milliseconds startup_engine_wait{10'000};
   std::chrono::milliseconds drain_timeout{5'000};
   std::size_t affinity_slack{8};
+  distributed::RoutingPolicy routing{distributed::RoutingPolicy::kLeastLoaded};
 };
 
 Options ParseOptions(const int argc, char** argv) {
@@ -114,6 +115,13 @@ Options ParseOptions(const int argc, char** argv) {
   options.drain_timeout =
       std::chrono::milliseconds(std::stoll(Argument(argc, argv, "--drain-timeout-ms", "5000")));
   options.affinity_slack = std::stoull(Argument(argc, argv, "--affinity-slack", "8"));
+  const std::string routing = Argument(argc, argv, "--routing", "least-loaded");
+  if (const auto policy = distributed::ParseRoutingPolicy(routing)) {
+    options.routing = *policy;
+  } else {
+    std::cerr << "--routing must be least-loaded, round-robin, or first\n";
+    std::exit(EXIT_FAILURE);
+  }
   return options;
 }
 
@@ -189,14 +197,16 @@ class InflightRegistry {
       const std::vector<distributed::EngineRecord>& engines,
       const std::unordered_set<std::string>& excluded,
       std::optional<coordination::PrefixHint> hint, const std::size_t affinity_slack,
-      const std::string_view tie_breaker) {
+      const std::string_view tie_breaker, const distributed::RoutingPolicy policy) {
     std::lock_guard lock(mutex_);
     auto selection = distributed::SelectEngine({.engines = engines,
                                                 .local_inflight = counts_,
                                                 .excluded = excluded,
                                                 .hint = std::move(hint),
                                                 .affinity_slack = affinity_slack,
-                                                .tie_breaker = tie_breaker});
+                                                .tie_breaker = tie_breaker,
+                                                .policy = policy,
+                                                .round_robin_ticket = round_robin_++});
     if (selection.has_value()) {
       ++counts_[selection->engine.engine_id];
     }
@@ -260,6 +270,7 @@ class InflightRegistry {
   mutable std::mutex mutex_;
   std::unordered_map<std::string, Entry> entries_;
   std::unordered_map<std::string, std::size_t> counts_;
+  std::size_t round_robin_{};
 };
 
 class StubCache {
@@ -571,7 +582,8 @@ Outcome Execute(Runtime& runtime, StorePool& db, const WorkItem& item) {
       hint = runtime.redis->GetPrefixOwner(request.model_revision(), request.prefix_id());
     }
     auto selection = runtime.inflight.SelectAndReserve(
-        engines, excluded, hint, runtime.options.affinity_slack, request_id);
+        engines, excluded, hint, runtime.options.affinity_slack, request_id,
+        runtime.options.routing);
     if (!selection.has_value()) {
       // Every live Engine already failed this request: retry them all.
       excluded.clear();
@@ -675,7 +687,12 @@ std::string StatsJson(Runtime& runtime, const std::size_t resolved) {
     }
   }
   JsonObject output;
+  const char* routing =
+      runtime.options.routing == distributed::RoutingPolicy::kRoundRobin ? "round-robin"
+      : runtime.options.routing == distributed::RoutingPolicy::kFirst    ? "first"
+                                                                          : "least-loaded";
   output.Add("router_id", runtime.options.router_id)
+      .Add("routing", routing)
       .Add("completed", resolved)
       .Add("succeeded", runtime.stats.completed.load())
       .Add("failed_terminal", runtime.stats.failed_terminal.load())

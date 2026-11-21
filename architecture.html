@@ -894,6 +894,29 @@
             </div>
           </div>
         </details>
+
+        <details class="work-item">
+          <summary>
+            <span class="phase-number">9</span>
+            <span class="phase-title">Compute efficiency</span>
+            <span class="phase-goal">Show that scheduling decisions spend less modeled accelerator time per delivered token, not just raise throughput.</span>
+            <span class="status">Implemented</span>
+          </summary>
+          <div class="work-body">
+            <div>
+              <h4>Understand</h4>
+              <p>The Engine accounts batch occupancy, useful versus wasted tokens, and prefill computed versus reused. Each experiment changes one decision: admission policy, routing policy, prefix hints, or cancellation.</p>
+            </div>
+            <div>
+              <h4>Read</h4>
+              <p><code>continuous_engine.cpp</code>, <code>engine_service.cpp</code>, <code>scripts/exp_batching_policy.sh</code>, <code>scripts/exp_fleet_efficiency.py</code>, and <code>docs/p9-compute-efficiency.md</code>.</p>
+            </div>
+            <div>
+              <h4>Evidence</h4>
+              <p>A deterministic CTest freezes the batching result; fleet runs repeat three times with compute deltas stable across host load. Findings that cut the other way (prefill interference, consolidation using less compute than spreading) are reported too.</p>
+            </div>
+          </div>
+        </details>
       </div>
     </section>
 
@@ -943,6 +966,21 @@
               <td>Full HTTP distributed path (Linux host)</td>
               <td>6,000 open-loop requests at 600 offered QPS, 2 Engines</td>
               <td>558 achieved QPS, 58 ms p50, 98 ms p99, 0 errors</td>
+            </tr>
+            <tr>
+              <td>Continuous vs request-level batching (deterministic)</td>
+              <td>Mixed output lengths, memory-bound cost model</td>
+              <td>Sustains 400 vs ~188 QPS; 44% less decode compute per token at 300 QPS</td>
+            </tr>
+            <tr>
+              <td>Redis prefix affinity (Linux host)</td>
+              <td>4 Engines, 64 shared 512-token prefixes</td>
+              <td>Prefill computed −84%, fleet hardware time −29% to −33%</td>
+            </tr>
+            <tr>
+              <td>Cancellation of abandoned attempts (Linux host)</td>
+              <td>10% of requests miss a 60 ms deadline</td>
+              <td>Hardware time −34% to −42% for the same completions</td>
             </tr>
           </tbody>
         </table>

@@ -60,6 +60,10 @@ cmake --build build/default --parallel
 ./scripts/run_bench.sh 100000
 ```
 
+The one-variable static-versus-continuous comparison this section says is missing now exists: see
+[`p9-compute-efficiency.md`](p9-compute-efficiency.md), which runs both policies on the same
+`ContinuousEngine` data structures.
+
 ## P7 nonzero-compute open-loop baseline
 
 Suite: deterministic fake-clock simulation. Arrival times are Poisson-distributed (seed 7); prompts
@@ -203,3 +207,8 @@ was added, which is why p99 ingest is high: those are the first requests after a
 - One Router and one gateway process on one host. This is not a horizontal scaling curve; adding
   Engines raises dispatch capacity but not the gateway or Router-ingest ceiling.
 - Shared-host noise affects tails. Re-run on a dedicated machine before quoting a p99.
+
+## P9 compute efficiency
+
+Batching policy, routing, prefix affinity, and cancellation measured as modeled compute per
+delivered token: [`p9-compute-efficiency.md`](p9-compute-efficiency.md).

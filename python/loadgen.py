@@ -39,6 +39,8 @@ def build_body(rng: random.Random, args: argparse.Namespace) -> dict:
         "priority": 0 if rng.random() < 0.1 else 1,
         "seed": rng.randrange(1 << 31),
     }
+    if args.long_fraction > 0 and rng.random() < args.long_fraction:
+        body["max_output_tokens"] = args.long_output_tokens
     if args.prefixes > 0 and rng.random() < args.prefix_fraction:
         body["prefix_id"] = f"prefix-{rng.randrange(args.prefixes)}"
         body["prefix_tokens"] = args.prefix_tokens
@@ -239,6 +241,9 @@ def main() -> None:
     parser.add_argument("--prefixes", type=int, default=0, help="distinct shared prefixes")
     parser.add_argument("--prefix-tokens", type=int, default=256)
     parser.add_argument("--prefix-fraction", type=float, default=1.0)
+    parser.add_argument("--long-fraction", type=float, default=0.0,
+                        help="fraction of requests with --long-output-tokens outputs")
+    parser.add_argument("--long-output-tokens", type=int, default=512)
     parser.add_argument("--require-all", action="store_true",
                         help="exit non-zero unless every request completed")
     args = parser.parse_args()

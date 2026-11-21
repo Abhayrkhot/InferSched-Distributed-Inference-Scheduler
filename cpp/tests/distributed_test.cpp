@@ -85,6 +85,69 @@ TEST(ContinuousEngine, CancelFreesRunningAndQueuedRequests) {
   EXPECT_TRUE(engine.kv_cache().CheckInvariants());
 }
 
+TEST(ContinuousEngine, StaticPolicyAdmitsOnlyAfterTheBatchDrains) {
+  for (const auto policy : {infersched::engine::AdmissionPolicy::kStatic,
+                            infersched::engine::AdmissionPolicy::kContinuous}) {
+    EngineConfig config;
+    config.admission = policy;
+    config.max_batch_sequences = 4;
+    ContinuousEngine engine(config);
+    engine.Submit(Request("long", 16, 10));
+    ASSERT_TRUE(engine.RunOneIteration());
+    EngineRequest late = Request("short", 16, 2);
+    late.arrival_time = engine.clock().Now();
+    engine.Submit(std::move(late));
+    ASSERT_TRUE(engine.RunOneIteration());
+    const bool static_policy = policy == infersched::engine::AdmissionPolicy::kStatic;
+    // Static leaves the free slot idle while the long sequence decodes.
+    EXPECT_EQ(engine.active_count(), static_policy ? 1u : 2u);
+    engine.RunUntilIdle();
+    const auto results = engine.TakeResults();
+    ASSERT_EQ(results.size(), 2u);
+    EXPECT_EQ(results.front().request_id, static_policy ? "long" : "short");
+  }
+}
+
+TEST(ContinuousEngine, TokenAccountingBalancesUnderPreemption) {
+  EngineConfig config;
+  config.kv_blocks = 12;
+  config.kv_block_size_tokens = 4;
+  config.max_batch_sequences = 4;
+  config.max_prefill_sequences_per_iteration = 4;
+  ContinuousEngine engine(config);
+  std::size_t requested = 0;
+  for (int index = 0; index < 6; ++index) {
+    EngineRequest request = Request("r" + std::to_string(index), 8, 12);
+    request.prompt_hash = "unique-" + std::to_string(index);  // No result-cache hits.
+    engine.Submit(std::move(request));
+    requested += 12;
+  }
+  engine.RunUntilIdle();
+  const auto& stats = engine.stats();
+  ASSERT_EQ(engine.TakeResults().size(), 6u);
+  EXPECT_GT(stats.preemptions, 0u);
+  // Every decoded token is either delivered or thrown away by preemption.
+  EXPECT_EQ(stats.decode_token_slots, stats.useful_output_tokens + stats.wasted_decode_tokens);
+  EXPECT_EQ(stats.useful_output_tokens, requested);
+  EXPECT_GT(stats.wasted_decode_tokens, 0u);
+  EXPECT_GT(stats.wasted_prefill_tokens, 0u);
+  EXPECT_EQ(stats.completed_requests, 6u);
+  EXPECT_GT(stats.mean_batch_occupancy(), 1.0);
+}
+
+TEST(ContinuousEngine, CancellationCountsTheComputeItDiscards) {
+  ContinuousEngine engine(EngineConfig{});
+  engine.Submit(Request("abandoned", 16, 100));
+  for (int step = 0; step < 3; ++step) {
+    ASSERT_TRUE(engine.RunOneIteration());
+  }
+  ASSERT_TRUE(engine.Cancel("abandoned", "client_cancelled"));
+  EXPECT_EQ(engine.stats().wasted_decode_tokens, 3u);
+  EXPECT_EQ(engine.stats().wasted_prefill_tokens, 16u);
+  EXPECT_EQ(engine.stats().useful_output_tokens, 0u);
+  EXPECT_EQ(engine.stats().cancellations, 1u);
+}
+
 TEST(ContinuousEngine, ReportsFirstTokenBeforeCompletion) {
   ContinuousEngine engine(EngineConfig{});
   engine.Submit(Request("r", 16, 3));
@@ -252,6 +315,29 @@ TEST_F(EngineServiceTest, FencedCancelRpcSupersedesOnlyTheMatchingAttempt) {
   EXPECT_TRUE(run.retryable);
 }
 
+TEST_F(EngineServiceTest, CancellationOffKeepsComputingAbandonedWork) {
+  Start({.step_delay = 5ms, .cancellation = false});
+  grpc::ClientContext context;
+  std::thread canceller([&] {
+    std::this_thread::sleep_for(50ms);
+    context.TryCancel();
+  });
+  const Observed run = Run(Dispatch("orphan", 40), &context);
+  canceller.join();
+  EXPECT_EQ(run.status.error_code(), grpc::StatusCode::CANCELLED);
+  const auto deadline = Clock::now() + 3s;
+  while (service_->stats().abandoned_output_tokens == 0 && Clock::now() < deadline) {
+    std::this_thread::sleep_for(10ms);
+  }
+  // The sequence ran to completion although nobody could accept it.
+  EXPECT_EQ(service_->stats().abandoned_output_tokens, 40u);
+  EXPECT_EQ(service_->stats().cancelled, 0u);
+  const std::string json = service_->UtilizationJson("engine-x");
+  EXPECT_NE(json.find("\"engine_id\":\"engine-x\""), std::string::npos);
+  EXPECT_NE(json.find("\"abandoned_output_tokens\":40"), std::string::npos);
+  EXPECT_NE(json.find("\"cancellation\":false"), std::string::npos);
+}
+
 TEST_F(EngineServiceTest, ConcurrentDispatchesAllCompleteAndDrain) {
   Start({});
   std::atomic<int> completed{0};
@@ -299,11 +385,15 @@ struct SelectFixture {
   std::vector<EngineRecord> engines;
   std::unordered_map<std::string, std::size_t> inflight;
   std::unordered_set<std::string> excluded;
+  infersched::distributed::RoutingPolicy policy{
+      infersched::distributed::RoutingPolicy::kLeastLoaded};
+  std::size_t ticket{};
   std::optional<std::string> Pick(std::optional<PrefixHint> hint = std::nullopt,
                                   bool* affinity = nullptr) {
     const auto selection = SelectEngine({.engines = engines, .local_inflight = inflight,
                                          .excluded = excluded, .hint = hint,
-                                         .affinity_slack = 8});
+                                         .affinity_slack = 8, .policy = policy,
+                                         .round_robin_ticket = ticket});
     if (!selection) {
       return std::nullopt;
     }
@@ -329,6 +419,27 @@ TEST(EngineSelector, SkipsExcludedSaturatedAndLowKvEngines) {
   EXPECT_EQ(fixture.Pick(), "c");
   fixture.excluded = {"a", "b", "c"};
   EXPECT_FALSE(fixture.Pick().has_value());
+}
+
+TEST(EngineSelector, RoundRobinAndFirstIgnoreLoadButHonourExclusion) {
+  using infersched::distributed::ParseRoutingPolicy;
+  using infersched::distributed::RoutingPolicy;
+  EXPECT_EQ(ParseRoutingPolicy("round-robin"), RoutingPolicy::kRoundRobin);
+  EXPECT_EQ(ParseRoutingPolicy("first"), RoutingPolicy::kFirst);
+  EXPECT_EQ(ParseRoutingPolicy("least-loaded"), RoutingPolicy::kLeastLoaded);
+  EXPECT_FALSE(ParseRoutingPolicy("random").has_value());
+
+  SelectFixture fixture{.engines = {Engine("c", 0), Engine("a", 50), Engine("b", 0)}};
+  fixture.policy = RoutingPolicy::kRoundRobin;
+  std::vector<std::string> picks;
+  for (fixture.ticket = 0; fixture.ticket < 4; ++fixture.ticket) {
+    picks.push_back(*fixture.Pick(PrefixHint{"b", "b-1"}));
+  }
+  EXPECT_EQ(picks, (std::vector<std::string>{"a", "b", "c", "a"}));
+  fixture.policy = RoutingPolicy::kFirst;
+  EXPECT_EQ(fixture.Pick(), "a");  // Even though "a" is the most loaded.
+  fixture.excluded = {"a"};
+  EXPECT_EQ(fixture.Pick(), "b");
 }
 
 TEST(EngineSelector, PrefixAffinityWithinSlackOnlyForTheSameIncarnation) {
@@ -366,6 +477,8 @@ TEST(RedisHints, UnreachableRedisDegradesToNoHintsQuickly) {
 
 TEST(RedisHints, ParsesAddressesAndDisablesOnEmpty) {
   EXPECT_FALSE(RedisHints::ParseAddress("").has_value());
+  EXPECT_FALSE(RedisHints::ParseAddress("none").has_value());
+  EXPECT_FALSE(RedisHints::ParseAddress("off").has_value());
   const auto parsed = RedisHints::ParseAddress("redis.internal:6380");
   ASSERT_TRUE(parsed.has_value());
   EXPECT_EQ(parsed->host, "redis.internal");

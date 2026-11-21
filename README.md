@@ -90,6 +90,24 @@ are bucket upper bounds; distributed percentiles are exact, client-observed, and
 warm-up on a host shared with other workloads. The distributed results are single-Router,
 single-gateway measurements, not a horizontal scaling curve.
 
+## Compute efficiency
+
+Throughput alone can rise by burning more compute, so the Engine also accounts modeled accelerator
+time per delivered token. Each experiment below changes one scheduling decision. Details, caveats,
+and repeat runs are in [`docs/p9-compute-efficiency.md`](docs/p9-compute-efficiency.md).
+
+| Decision | Setup | Effect on compute |
+|---|---|---|
+| Continuous vs request-level batching | Same Engine, mixed output lengths, memory-bound cost model | Sustains 400 vs ~188 QPS; 44% less decode compute per token at 300 QPS (deterministic) |
+| Redis prefix affinity | 4 Engines, 64 shared 512-token prefixes | Prefill computed −84%, fleet hardware time −29% to −33% |
+| Cancellation of abandoned attempts | 10% of requests miss a 60 ms deadline | Hardware time −34% to −42% for the same 2,703 completions |
+| Least-loaded vs round-robin | 4 Engines, one 3× slower | Hardware time −10% to −19%, p99 −22% (quiet run) |
+
+Two findings cut the other way. Continuous admission charges each new prefill into the running
+batch, which raises p99 on prefill-heavy workloads (chunked prefill is not implemented). Sending all
+traffic to one Engine uses about 60% less compute than any spreading policy, so spreading is a
+latency choice, not a saving. "Compute" is the cost model's modeled time, not GPU kernels.
+
 ## Reliability model
 
 - **Delivery:** Kafka ingestion is at least once.
@@ -166,7 +184,10 @@ PYTHONPATH=python .venv/bin/python python/loadgen.py --url http://127.0.0.1:8000
 ```
 
 Benchmarks: `scripts/run_p7_distributed_bench.sh` (full HTTP path) and `scripts/run_router_burst.sh`
-(Router path only).
+(Router path only). Efficiency experiments: `scripts/exp_batching_policy.sh` (deterministic) and
+`scripts/exp_fleet_efficiency.py` (live services). Engines print their compute counters as a JSON
+line on SIGTERM; `--policy static`, `--cancellation off`, and the `--*-us` cost-model flags exist
+for these experiments. The Router takes `--routing least-loaded|round-robin|first`.
 
 ## Further reading
 
@@ -176,4 +197,5 @@ Benchmarks: `scripts/run_p7_distributed_bench.sh` (full HTTP path) and `scripts/
 - [`docs/p6-multi-router-rebalancing.md`](docs/p6-multi-router-rebalancing.md): rebalance and crash recovery
 - [`docs/p7-control-plane-observability.md`](docs/p7-control-plane-observability.md): gateway, load generation, and metrics
 - [`docs/p8-multi-engine-routing.md`](docs/p8-multi-engine-routing.md): multi-Engine dispatch, retries, cancellation, Redis hints, tracing
+- [`docs/p9-compute-efficiency.md`](docs/p9-compute-efficiency.md): compute accounting and one-variable efficiency experiments
 - [`docs/benchmarks.md`](docs/benchmarks.md): reproducible measurements and claim boundaries

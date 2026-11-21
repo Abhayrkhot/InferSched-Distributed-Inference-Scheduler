@@ -21,6 +21,14 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# The fresh group starts with committed offsets at the current end of the
+# topic: older test traffic is skipped (a long-lived topic would otherwise be
+# replayed from `earliest`), while anything published from now on, including
+# Router 1's unfinished work, is redelivered to Router 2 after the kill.
+docker exec infersched-kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 --group "${group}" --topic inference.requests \
+  --reset-offsets --to-latest --execute >/dev/null
+
 "${router_binary}" --listen 127.0.0.1:55211 --router-id p6-router-1 \
   --consumer-group "${group}" --requests 100000 --run-seconds 40 \
   --ready-file "${ready1}" \

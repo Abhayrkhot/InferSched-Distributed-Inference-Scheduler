@@ -34,6 +34,9 @@ struct Arguments {
   std::uint64_t seed{7};
   bool telemetry{true};
   std::string cache{"none"};
+  std::string policy{"continuous"};   // open_loop: continuous | static
+  std::string cost_model{"p7"};       // open_loop: p7 | memory-bound
+  std::string workload{"short"};      // open_loop: short | mixed
 };
 
 infersched::engine::EngineConfig BenchmarkConfig();
@@ -79,6 +82,12 @@ Arguments ParseArguments(const int argc, char** argv) {
       arguments.telemetry = value == "enabled";
     } else if (argument == "--cache") {
       arguments.cache = value;
+    } else if (argument == "--policy") {
+      arguments.policy = value;
+    } else if (argument == "--cost-model") {
+      arguments.cost_model = value;
+    } else if (argument == "--workload") {
+      arguments.workload = value;
     } else {
       std::cerr << "unknown argument: " << argument << '\n';
       std::exit(EXIT_FAILURE);
@@ -97,6 +106,21 @@ void RunOpenLoop(const Arguments& arguments) {
   config.cost_model.prefill_per_token = std::chrono::microseconds(10);
   config.cost_model.decode_fixed = std::chrono::microseconds(50);
   config.cost_model.decode_per_sequence = std::chrono::microseconds(10);
+  if (arguments.cost_model == "memory-bound") {
+    // Decode dominated by a per-step fixed cost (reading weights once per
+    // step), as on bandwidth-bound accelerators: batching is nearly free.
+    config.cost_model.decode_fixed = std::chrono::microseconds(500);
+    config.cost_model.decode_per_sequence = std::chrono::microseconds(10);
+  } else if (arguments.cost_model != "p7") {
+    std::cerr << "--cost-model must be p7 or memory-bound\n";
+    std::exit(EXIT_FAILURE);
+  }
+  if (arguments.policy == "static") {
+    config.admission = infersched::engine::AdmissionPolicy::kStatic;
+  } else if (arguments.policy != "continuous") {
+    std::cerr << "--policy must be continuous or static\n";
+    std::exit(EXIT_FAILURE);
+  }
   config.cost_model.jitter_basis_points = 200;
   config.kv_blocks = 16'384;
   config.prefix_cache_entries = 1024;
@@ -114,6 +138,18 @@ void RunOpenLoop(const Arguments& arguments) {
           std::chrono::duration<double>(interarrival(random)));
     }
     auto request = MakeRequest(index);
+    if (arguments.workload == "mixed") {
+      // High output-length variance, the case request-level batching handles
+      // worst: 80% short replies (1-16 tokens), 20% long ones (64-512 tokens).
+      // Deterministic from the index so both policies see identical requests.
+      const std::uint64_t mix = (static_cast<std::uint64_t>(index) * 2654435761ULL) >> 7;
+      request.max_output_tokens =
+          mix % 5 == 0 ? 64 + static_cast<std::size_t>(mix % 449)
+                       : 1 + static_cast<std::size_t>(mix % 16);
+    } else if (arguments.workload != "short") {
+      std::cerr << "--workload must be short or mixed\n";
+      std::exit(EXIT_FAILURE);
+    }
     if ((arguments.cache == "result" || arguments.cache == "both") &&
         index % 5 == 4) {
       const std::size_t origin = index - 4;
@@ -140,6 +176,10 @@ void RunOpenLoop(const Arguments& arguments) {
   infersched::metrics::Histogram ttft;
   infersched::metrics::Histogram end_to_end;
   infersched::metrics::Histogram low_priority;
+  std::vector<double> e2e_exact_ms;
+  std::vector<double> ttft_exact_ms;
+  e2e_exact_ms.reserve(engine.results().size());
+  ttft_exact_ms.reserve(engine.results().size());
   for (const auto& result : engine.results()) {
     const auto submitted = arrivals.at(result.request_id);
     const auto ttft_us = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -148,6 +188,8 @@ void RunOpenLoop(const Arguments& arguments) {
     const auto e2e_us = std::chrono::duration_cast<std::chrono::microseconds>(
                             result.completed_at - submitted)
                             .count();
+    e2e_exact_ms.push_back(static_cast<double>(e2e_us) / 1000.0);
+    ttft_exact_ms.push_back(static_cast<double>(ttft_us) / 1000.0);
     if (arguments.telemetry) {
       ttft.Record(
           static_cast<std::uint64_t>(std::max<std::int64_t>(ttft_us, 0)));
@@ -169,6 +211,21 @@ void RunOpenLoop(const Arguments& arguments) {
   const auto drain_lag = std::chrono::duration_cast<std::chrono::microseconds>(
       engine.clock().Now() - arrival);
   const bool complete = engine.results().size() == arguments.requests;
+  const auto exact = [](std::vector<double>& values, const double quantile) {
+    if (values.empty()) {
+      return 0.0;
+    }
+    std::ranges::sort(values);
+    const auto index = static_cast<std::size_t>(
+        static_cast<double>(values.size() - 1) * quantile);
+    return values[index];
+  };
+  const auto& stats = engine.stats();
+  const double decode_us_per_useful_token =
+      stats.useful_output_tokens == 0
+          ? 0.0
+          : std::chrono::duration<double, std::micro>(stats.simulated_decode_time).count() /
+                static_cast<double>(stats.useful_output_tokens);
   engine.ClearCaches();
   const bool zero_leak = engine.kv_cache().allocated_blocks() == 0;
   const double benchmark_wall_ms =
@@ -204,6 +261,21 @@ void RunOpenLoop(const Arguments& arguments) {
                     : static_cast<double>(
                           engine.stats().result_cache_request_hits) /
                           static_cast<double>(engine.stats().result_cache_requests))
+            << ",\"policy\":\"" << arguments.policy << "\""
+            << ",\"cost_model\":\"" << arguments.cost_model << "\""
+            << ",\"workload\":\"" << arguments.workload << "\""
+            << ",\"decode_iterations\":" << stats.iterations
+            << ",\"mean_batch_occupancy\":" << stats.mean_batch_occupancy()
+            << ",\"useful_output_tokens\":" << stats.useful_output_tokens
+            << ",\"wasted_decode_tokens\":" << stats.wasted_decode_tokens
+            << ",\"preemptions\":" << stats.preemptions
+            << ",\"modeled_busy_ms\":"
+            << std::chrono::duration<double, std::milli>(stats.simulated_busy_time).count()
+            << ",\"decode_us_per_useful_token\":" << decode_us_per_useful_token
+            << ",\"useful_tokens_per_busy_s\":" << stats.useful_tokens_per_busy_second()
+            << ",\"ttft_p99_exact_ms\":" << exact(ttft_exact_ms, 0.99)
+            << ",\"e2e_p50_exact_ms\":" << exact(e2e_exact_ms, 0.50)
+            << ",\"e2e_p99_exact_ms\":" << exact(e2e_exact_ms, 0.99)
             << ",\"complete\":" << std::boolalpha << complete
             << ",\"zero_kv_leak\":" << zero_leak << "}\n";
   if (!complete || !zero_leak) {

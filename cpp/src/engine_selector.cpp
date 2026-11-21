@@ -4,6 +4,7 @@
 #include <functional>
 #include <string>
 #include <tuple>
+#include <vector>
 
 namespace infersched::distributed {
 namespace {
@@ -33,7 +34,46 @@ std::size_t EstimateLoad(const EngineRecord& engine, const std::size_t local_inf
   return load;
 }
 
+std::optional<RoutingPolicy> ParseRoutingPolicy(const std::string_view name) {
+  if (name == "least-loaded") {
+    return RoutingPolicy::kLeastLoaded;
+  }
+  if (name == "round-robin") {
+    return RoutingPolicy::kRoundRobin;
+  }
+  if (name == "first") {
+    return RoutingPolicy::kFirst;
+  }
+  return std::nullopt;
+}
+
+namespace {
+
+std::optional<Selection> SelectByOrder(const SelectionInput& input) {
+  std::vector<const EngineRecord*> candidates;
+  for (const auto& engine : input.engines) {
+    if (!input.excluded.contains(engine.engine_id)) {
+      candidates.push_back(&engine);
+    }
+  }
+  if (candidates.empty()) {
+    return std::nullopt;
+  }
+  std::ranges::sort(candidates, [](const EngineRecord* lhs, const EngineRecord* rhs) {
+    return lhs->engine_id < rhs->engine_id;
+  });
+  const std::size_t index = input.policy == RoutingPolicy::kRoundRobin
+                                ? input.round_robin_ticket % candidates.size()
+                                : 0;
+  return Selection{.engine = *candidates[index], .affinity = false};
+}
+
+}  // namespace
+
 std::optional<Selection> SelectEngine(const SelectionInput& input) {
+  if (input.policy != RoutingPolicy::kLeastLoaded) {
+    return SelectByOrder(input);
+  }
   const EngineRecord* best = nullptr;
   using Key = std::tuple<bool, std::size_t, std::size_t, std::string_view>;
   Key best_key;

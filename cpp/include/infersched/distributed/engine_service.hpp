@@ -8,6 +8,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -32,6 +33,10 @@ struct EngineServiceOptions {
   // Bound on remembered (request_id -> attempt) fences used to reject stale
   // or duplicate dispatches. Postgres remains the authoritative fence.
   std::size_t fence_memory{65536};
+  // When false, Cancel RPCs and abandoned streams no longer stop the
+  // sequence: it runs to completion and its result is discarded. Exists only
+  // to measure the compute that cancellation saves.
+  bool cancellation{true};
 };
 
 // Network wrapper around one ContinuousEngine. A single worker thread owns the
@@ -59,6 +64,9 @@ class EngineService final : public v1::EngineControl::Service {
   [[nodiscard]] v1::EngineCapacity Capacity() const;
 
   struct Stats {
+    // Output tokens computed for attempts whose result nobody accepted
+    // (stream abandoned or attempt superseded) because cancellation was off.
+    std::uint64_t abandoned_output_tokens{};
     std::uint64_t accepted{};
     std::uint64_t rejected{};
     std::uint64_t completed{};
@@ -67,6 +75,10 @@ class EngineService final : public v1::EngineControl::Service {
     std::size_t peak_running{};
   };
   [[nodiscard]] Stats stats() const;
+  // Compute-efficiency snapshot as one JSON object: engine counters (modeled
+  // busy time, batch occupancy, useful vs wasted tokens, prefill reuse) plus
+  // wall-clock busy fraction over the window from first accept to last finish.
+  [[nodiscard]] std::string UtilizationJson(const std::string& engine_id) const;
 
  private:
   struct Job {
@@ -76,6 +88,7 @@ class EngineService final : public v1::EngineControl::Service {
     std::deque<v1::DispatchEvent> events;
     bool done{};
     std::atomic<bool> superseded{};
+    std::atomic<bool> abandoned{};  // Client stream gone before the result.
   };
 
   [[nodiscard]] std::string ValidateAndReserve(
@@ -106,6 +119,9 @@ class EngineService final : public v1::EngineControl::Service {
   bool draining_{};
   bool stop_{};
   Stats stats_;
+  engine::ContinuousEngineStats engine_stats_;  // Worker's latest copy.
+  std::optional<std::chrono::steady_clock::time_point> first_accept_;
+  std::optional<std::chrono::steady_clock::time_point> last_finish_;
 
   // Published by the worker for Capacity()/heartbeats.
   std::atomic<std::size_t> free_kv_blocks_;
