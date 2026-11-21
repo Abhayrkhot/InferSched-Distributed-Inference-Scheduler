@@ -218,3 +218,16 @@ def test_lost_results_expire_and_free_capacity() -> None:
         assert state.results[request_id]["state"] == "COMPLETED"
 
     asyncio.run(scenario())
+
+
+def test_request_expires_exactly_at_its_deadline() -> None:
+    # With this start time (seen in CI), (started + 10) - started is
+    # 9.99999999999997, so an elapsed-time comparison missed the deadline.
+    async def scenario():
+        state = make_state(capacity=1, result_timeout_s=10)
+        request_id, _ = await submit_with_delivery(state, SubmitRequest(prompt_tokens=16))
+        started = 252.15820775
+        state.pending[request_id].started = started
+        assert state.expire_pending(now=started + 10) == 1
+
+    asyncio.run(scenario())

@@ -314,7 +314,9 @@ class GatewayState:
         expired: list[Pending] = []
         with self.lock:
             for request_id, entry in list(self.pending.items()):
-                if now - entry.started >= self.result_timeout_s:
+                # Compare against the deadline: now - started can round below
+                # the timeout when now is exactly started + timeout.
+                if now >= entry.started + self.result_timeout_s:
                     del self.pending[request_id]
                     self.expired[request_id] = None
                     expired.append(entry)
